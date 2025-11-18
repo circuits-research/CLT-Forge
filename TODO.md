@@ -1,0 +1,4 @@
+- bfloat16 training and gradient clipping, should we just use autocasting ?
+- what to do with the functional loss capability, removed for current version ?
+- fixing memory problems in loading the metrics, see _update_layer_metrics_history
+- remove all prints for logger

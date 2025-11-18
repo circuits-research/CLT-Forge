@@ -1,0 +1,33 @@
+# ruff
+.ruff_cache
+
+# chglog
+.chglog
+
+# training output
+wandb/
+checkpoints/
+
+# poetry
+poetry.lock
+
+# poetry
+pyproject.toml
+
+# logs
+logs/
+**/logs/
+
+# test 
+tests/ckpts_ddp/
+
+# cache
+cache/ 
+**/cache/
+
+# save
+save/
+**/save/
+
+# claude
+CLAUDE.md
