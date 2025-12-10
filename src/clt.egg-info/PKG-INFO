@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: clt
+Version: 0.1.0
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: torch
+Requires-Dist: sae-lens
+Requires-Dist: pydantic>=2.11
+Requires-Dist: wandb
+Requires-Dist: safetensors
+Dynamic: license-file

@@ -16,7 +16,7 @@ from transformer_lens.utils import (
     lm_cross_entropy_loss,
 )
 from transformers import PreTrainedTokenizerBase
-from featflow import logger
+from clt import logger
 
 def  load_model(
     model_class_name: str,
