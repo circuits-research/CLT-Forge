@@ -3,8 +3,8 @@ import wandb
 
 from pydantic import BaseModel, field_validator, model_validator, ConfigDict
 from typing import Any, Dict, Optional, TypeVar
-from featflow import logger
-from featflow.config import CLTConfig
+from clt import logger
+from clt.config import CLTConfig
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -46,7 +46,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     train_batch_size_tokens: int = 4096
     adam_beta1: float = 0.0
     adam_beta2: float = 0.999
-    lr: float = 7e-5
+    lr: float = 1e-5
     lr_warm_up_steps: int = 1000
     lr_decay_steps: int = 1000
     decay_stable_steps: int = 0
@@ -55,19 +55,19 @@ class CLTTrainingRunnerConfig(BaseModel):
     lr_warm_up_type: str = "cosine"
     use_mixed_precision: bool = True
 
-    # # ------Functional Loss------------------
-    # functional_loss: Optional[str] = None
-    # fc_warm_up_type: str = "cosine"
-    # fc_coefficient: float = 1e-3
-    # fc_warm_up_steps: Optional[int] = None
-    # fc_waiting_steps: Optional[int] = None
+    # ------Functional Loss------------------
+    functional_loss: Optional[str] = None
+    fc_warm_up_type: str = "cosine"
+    fc_coefficient: float = 1e-3
+    fc_warm_up_steps: Optional[int] = None
+    fc_waiting_steps: Optional[int] = None
 
     # -----Sparsity---------------------------
-    l0_coefficient: float = 1e-3
-    l0_warm_up_steps: int = 1000
+    l0_coefficient: float = 1e-4
+    l0_warm_up_steps: int = 5000
     l0_waiting_steps: int = 0
     l0_warm_up_type: str = "linear"
-    dead_penalty_coef: float =  7.5 * 1e-8
+    dead_penalty_coef: float =  0.0 #7.5 * 1e-8
     optimal_l0: Optional[float] = None
     checkpoint_l0: Optional[list[int]] = None
 
@@ -136,9 +136,8 @@ class CLTTrainingRunnerConfig(BaseModel):
     def wandb_id_check(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         wandb_id = values.get("wandb_id")
         if not wandb_id:
-            wandb_id = wandb.util.generate_id() # type: ignore[attr-defined]
-            values["wandb_id"] = wandb_id
-
+            raise ValueError("wandb_id must be provided")  # Force explicit
+        
         base_path = values.get("checkpoint_path", "checkpoints")
         values["checkpoint_path"] = f"{base_path}/{wandb_id}"
         return values

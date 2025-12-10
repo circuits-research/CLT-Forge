@@ -1,0 +1,5 @@
+torch
+sae-lens
+pydantic>=2.11
+wandb
+safetensors

@@ -58,6 +58,11 @@ class CLT(nn.Module):
 
         init_device = self.device if not cfg.fsdp else torch.device("cpu")
 
+        if world_size > 1 and not cfg.ddp and not cfg.fsdp:
+            torch.manual_seed(cfg.seed + rank)  # Different seed per rank
+        else:
+            torch.manual_seed(cfg.seed)  # Same seed for DDP/FSDP
+
         self.N_layers_out = torch.tensor(
             [cfg.n_layers - (i + 1) for i in range(self.N_layers)],
             dtype=torch.long,
@@ -109,7 +114,7 @@ class CLT(nn.Module):
     def _initialize(self) -> None:
         # Anthropic guidelines
         # encoder:  U(-1/n_features,  +1/n_features)
-        enc_lim = 1.0 / self.d_latent**0.5
+        enc_lim = 1.0 / self.local_d_latent**0.5
         for W in self.W_enc:
             nn.init.uniform_(W, -enc_lim, enc_lim)
 
@@ -149,7 +154,7 @@ class CLT(nn.Module):
                     bias_values[layer, feature] = required_bias
             
             self.b_enc.data = bias_values.to(self.device)
-            print(f"Initialized b_enc with target activation rate {target_activation_rate:.6f}")
+            print(f"Initialized b_enc with target activation rate {target_activation_rate:.6f}", flush=True)
             
             # # Verify the initialization by computing actual activation rates
             # feat_act, _ = self.encode(x)            
@@ -158,6 +163,8 @@ class CLT(nn.Module):
             
             # print(f"Actual average activation rate: {avg_activation_rate * self.d_latent:.0f}")
             # print(f"Expected ~{self.d_latent * target_activation_rate:.0f} ")
+
+
 
     def encode(
         self,
@@ -194,49 +201,64 @@ class CLT(nn.Module):
         layer: Optional[int] = None
     ) -> Float[torch.Tensor, "..."]:
         """
-        z: [B, N_layers, d_latent] if layer is None, else [B, d_latent]
-        output: [B, N_layers, d_in] if layer is None, else [B, N_layers_out, d_in]
+        Decode latent features z back to model activations.
+        Handles both cross-layer decoders and single-layer decoders.
+        Correctly aggregates bias and supports distributed training.
+        
+        CRITICAL: In feature sharding, after all_reduce(SUM):
+        - ALL ranks have identical 'out' tensor
+        - b_dec is replicated (same on all ranks)
+        - ALL ranks add b_dec locally → identical result
+        - No broadcast needed (keeps gradient flow clean)
         """
 
         if layer is None:
+            # Full decode
             if self.cfg.cross_layer_decoders:
                 B = z.shape[0]
-                z_sel = z.index_select(1, self.l_idx) # [B, K, d_latent] 
-                
-                contrib = torch.einsum(
-                    'bkd,kdf->bkf',
-                    z_sel,
-                    self.W_dec
-                ) + self.b_dec # [B, K, d_out]
-                
-                out = torch.zeros(B, self.N_layers, self.d_in,
-                                dtype=self.dtype, device=self.device)
+                z_sel = z.index_select(1, self.l_idx)  # select source layers
+
+                # Compute contributions from W_dec only
+                contrib = torch.einsum('bkd,kdf->bkf', z_sel, self.W_dec)  # [B, N_dec, d_in]
+
+                # Aggregate contributions into target layers
+                out = torch.zeros(B, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
                 out = out.index_add(1, self.k_idx, contrib)
+
+                # All-reduce contributions across ranks if using distributed (feature sharding only)
+                if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+                    dist.all_reduce(out, op=dist.ReduceOp.SUM)
+                
+                # ALL ranks add replicated bias locally
+                b_contrib = torch.zeros(1, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
+                b_contrib = b_contrib.index_add(1, self.k_idx, self.b_dec.to(out.dtype).unsqueeze(0))
+                out = out + b_contrib
+
             else:
-                out = torch.einsum("bnk,nkd->bnd", z, self.W_dec) + self.b_dec
+                # Single-layer decoder
+                out = torch.einsum("bnk,nkd->bnd", z, self.W_dec)  # [B, N_layers, d_in]
+                
+                # All-reduce contributions across ranks if using distributed (feature sharding only)
+                if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+                    dist.all_reduce(out, op=dist.ReduceOp.SUM)
+                
+                # ALL ranks add replicated bias locally
+                out = out + self.b_dec.to(out.dtype).unsqueeze(0)
+
         else:
+            # Layer-specific decode
             assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
             if self.cfg.cross_layer_decoders:
                 indices = (self.l_idx == layer).nonzero(as_tuple=True)[0]
-                
-                z_layer = z.unsqueeze(1)  # [B, 1, d_latent]
-                z_layer = z_layer.expand(-1, len(indices), -1)  # [B, num_decoders, d_latent]
-                
-                W_dec_layer = self.W_dec[indices]  # [num_decoders, d_latent, d_in]
-                b_dec_layer = self.b_dec[indices]  # [num_decoders, d_in]
+                z_layer = z.unsqueeze(1).expand(-1, len(indices), -1)
+                W_dec_layer = self.W_dec[indices]
+                b_dec_layer = self.b_dec[indices]
+                out = torch.einsum('bkd,kdf->bkf', z_layer, W_dec_layer) + b_dec_layer
+            else:
+                out = z @ self.W_dec[layer] + self.b_dec[layer]
 
-                out = torch.einsum(
-                    'bkd,kdf->bkf',                 
-                    z_layer,
-                    W_dec_layer
-                ) + b_dec_layer # [B, num_decoders, d_in]
-
-            else: 
-                out = z @ self.W_dec[layer] + self.b_dec[layer] # [B, d_out]
-        
-        if self.world_size > 1:
-            dist.all_reduce(out, op=dist.ReduceOp.SUM)
         return out
+
 
     def forward_eval(
         self,
@@ -275,30 +297,44 @@ class CLT(nn.Module):
         feat_act, hidden_pre = self.encode(act_in)
         act_pred = self.decode(feat_act)
 
-        ### MSE loss
+        ### MSE loss (Differentiable)
         mse_loss_tensor = torch.nn.functional.mse_loss(act_out, act_pred, reduction="none")
         mse_loss_accross_layers = mse_loss_tensor.sum(dim=-1).mean(dim=0)
         mse_loss = mse_loss_accross_layers.sum()
 
-        ### L0 regularization
+        ### L0 regularization - compute locally with full gradient flow
         if self.cfg.cross_layer_decoders:
             squared_norms = (self.W_dec**2).sum(dim=2)
-            feature_norms = torch.sqrt(torch.matmul(self.layer_mask, squared_norms)) # [N_layers, d_latent]
+            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask, squared_norms))
         else: 
-            feature_norms = self.W_dec.norm(dim=2) # [N_layers, d_latent]
+            feature_norms_local = self.W_dec.norm(dim=2)
         
-        weighted_activations = feat_act * feature_norms # [batch_size, N_layers, d_latent]
-        tanh_weighted_activations = torch.tanh(C_l0_COEF * weighted_activations)  # [batch_size, N_layers, d_latent]
-        l0_loss_accross_layers = l0_coef * tanh_weighted_activations.sum(dim=-1).mean(dim=0)  # [N_layers]
-        l0_loss = l0_loss_accross_layers.sum()
-
-        ### Dead feature penalty
-        dead_feature_loss = df_coef * torch.relu(torch.exp(self.log_threshold)-hidden_pre) * feature_norms
+        print(f"Rank {self.rank}: feat_act shape = {feat_act.shape}")
+        print(f"Rank {self.rank}: feature_norms_local shape = {feature_norms_local.shape}")
+        print(f"Rank {self.rank}: W_dec shape = {self.W_dec.shape}")
+        print(f"Rank {self.rank}: W_dec requires_grad = {self.W_dec.requires_grad}")
+        print(f"Rank {self.rank}: feature_norms_local requires_grad = {feature_norms_local.requires_grad}")
+        # Compute L0 loss locally - gradients flow to W_dec)
+        weighted_activations = feat_act * feature_norms_local
+        tanh_weighted_activations = torch.tanh(C_l0_COEF * weighted_activations)
+        l0_loss_accross_layers = l0_coef * tanh_weighted_activations.sum(dim=-1).mean(dim=0)
+        l0_loss_local = l0_loss_accross_layers.sum()
+        
+        # SUM losses across ranks (per the L_sparsity = λ ∑_ℓ ∑_i formula)
+        if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+            dist.all_reduce(l0_loss_local, op=dist.ReduceOp.SUM)
+        
+        l0_loss = l0_loss_local
+        print(f"Rank {self.rank}: W_dec.requires_grad={self.W_dec.requires_grad}, has grad={self.W_dec.grad is not None}")
+        print(f"Rank {self.rank}: L0 loss = {l0_loss.item():.6f}")
+        print(f"Rank {self.rank}: feature_norms has grad = {hasattr(feature_norms_local, 'grad') and feature_norms_local.grad is not None}")
+        ### Dead feature penalty 
+        dead_feature_loss = df_coef * torch.relu(torch.exp(self.log_threshold) - hidden_pre) * feature_norms_local
         dead_feature_loss = dead_feature_loss.sum(dim=-1).mean(dim=0).sum()
 
         ### Dead feature count
         with torch.no_grad(): 
-            firing = feat_act.sum(dim=0) > 0 # [N_layers, d_latent]
+            firing = feat_act.sum(dim=0) > 0
             self.feature_count += 1
             self.feature_count[firing] = 0
 
@@ -309,12 +345,12 @@ class CLT(nn.Module):
             hidden_pre=hidden_pre,
             act_pred=act_pred,
             mse_loss=mse_loss,
-            l0_loss=l0_loss, 
+            l0_loss=l0_loss,
             dead_feature_loss=dead_feature_loss,
             mse_loss_accross_layers=mse_loss_accross_layers,
             l0_loss_accross_layers=l0_loss_accross_layers
         )
-    
+        
     @torch.no_grad()
     def get_dead_features(self) -> torch.Tensor:
         return self.feature_count > self.cfg.dead_feature_window # [N_layers, d_latent]

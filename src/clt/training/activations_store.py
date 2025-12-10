@@ -57,11 +57,10 @@ class ActivationsStore:
         self.return_tokens = False 
         self.mix_with_previous_buffer = True
         
-        # important for transformer lens, depending on chosen hook
         model.cfg.use_hook_mlp_in = True 
-
+        self.buffer_counter = 0
         if cfg.n_batches_in_buffer < 2 or cfg.n_batches_in_buffer % 2:
-            raise ValueError("n_batches_in_buffer must be an even integer ≥ 2")
+            raise ValueError("n_batches_in_buffer must be an even integer ≥ 2")
 
         self.buffer_batches = cfg.n_batches_in_buffer
         self.half_buffer_batches = cfg.n_batches_in_buffer // 2
@@ -72,10 +71,8 @@ class ActivationsStore:
         self.hook_names_in  = [f"blocks.{i}.ln2.hook_normalized"  for i in range(self.N_layers)]
         self.hook_names_out = [f"blocks.{i}.hook_mlp_out" for i in range(self.N_layers)]
 
-        # load tokenized dataset
         if self.cfg.cached_activations_path is None: 
 
-            # For multilingual training, can be ignored
             if "CausalNLP" in self.cfg.model_name or "meta-llama" in self.cfg.model_name: 
                 self.raw_ds = load_dataset_auto(cfg.dataset_path, split="all").shuffle(seed=42)
                 logger.info(f"First sample sequence: {self.raw_ds[0]}")
@@ -85,7 +82,6 @@ class ActivationsStore:
                 self.raw_ds = load_dataset_auto(cfg.dataset_path, split="train[:250000]")
                 logger.info(f"Loaded dataset")
         
-            # Accept 'input_ids' if 'tokens' is missing
             if "tokens" not in self.raw_ds.column_names:
                 if "input_ids" in self.raw_ds.column_names:
                     logger.info("tokens column not found — using input_ids instead.")
@@ -95,7 +91,6 @@ class ActivationsStore:
                         f"Dataset {cfg.dataset_path} must contain a pre-tokenised tokens or input_ids column."
                     )
                 
-            # first sample must be 1‑D int list / tensor
             first_tok = self.raw_ds[0]["tokens"]
 
             if isinstance(first_tok, torch.Tensor) and first_tok.ndim != 1:
@@ -120,7 +115,9 @@ class ActivationsStore:
         self.estimated_norm_scaling_factor_in = estimated_norm_scaling_factor_in
         self.estimated_norm_scaling_factor_out = estimated_norm_scaling_factor_out
 
+        self._skip_norm_application = True
         self.set_norm_scaling_factor_if_needed()
+        self._skip_norm_application = False
 
         self._rebuild_buffers()
 
@@ -133,9 +130,13 @@ class ActivationsStore:
         Yield each row's token vector as a 1‑D torch.Tensor on **CPU**.
         """
         dataset_len = len(self.raw_ds)
-        shard_size = dataset_len // self.world_size
-        start = self.rank * shard_size
-        end = dataset_len if self.rank == self.world_size - 1 else start + shard_size
+        if self.cfg.ddp or self.cfg.fsdp:
+            shard_size = dataset_len // self.world_size
+            start = self.rank * shard_size
+            end = dataset_len if self.rank == self.world_size - 1 else start + shard_size
+        else:
+            start = 0
+            end = dataset_len
         self.runtime_doc_languages = []
 
         for i in range(start, end):
@@ -256,62 +257,82 @@ class ActivationsStore:
 
     def _rebuild_buffers(self) -> None:
 
-        return_tokens = self.return_tokens
-        use_cached = self.cfg.cached_activations_path is not None
+            return_tokens = self.return_tokens
+            use_cached = self.cfg.cached_activations_path is not None
 
-        if use_cached:
-            result = self._load_buffer_from_cached(return_tokens=return_tokens)
-        else:
-            result = self._fresh_activation_batches(
-                return_tokens=return_tokens,
-                mix_with_previous_buffer=self.mix_with_previous_buffer
-            )
-        
-        if return_tokens:
-            new_in, new_out, new_tokens = result
-        else:
-            new_in, new_out = result
-
-        if self.mix_with_previous_buffer and self._storage_in is not None:
-            all_in = torch.cat([self._storage_in, new_in], dim=0)
-            all_out = torch.cat([self._storage_out, new_out], dim=0)
-            if self.return_tokens:
-                all_tokens = torch.cat([self._storage_tokens, new_tokens], dim=0)
-        else:
-            all_in, all_out = new_in, new_out
-            if self.return_tokens:
-                all_tokens = new_tokens
+            if use_cached:
+                result = self._load_buffer_from_cached(return_tokens=return_tokens)
+            else:
+                result = self._fresh_activation_batches(
+                    return_tokens=return_tokens,
+                    mix_with_previous_buffer=self.mix_with_previous_buffer
+                )
             
-        if self.shuffle:
-            perm = torch.randperm(all_in.size(0), device="cpu") #what should it be ??? 
-            all_in, all_out = all_in[perm], all_out[perm]
+            if return_tokens:
+                new_in, new_out, new_tokens = result
+            else:
+                new_in, new_out = result
+
+            if self.mix_with_previous_buffer and self._storage_in is not None:
+                all_in = torch.cat([self._storage_in, new_in], dim=0)
+                all_out = torch.cat([self._storage_out, new_out], dim=0)
+                if self.return_tokens:
+                    all_tokens = torch.cat([self._storage_tokens, new_tokens], dim=0)
+            else:
+                all_in, all_out = new_in, new_out
+                if self.return_tokens:
+                    all_tokens = new_tokens
+                
+            # Ensures all ranks use the same seed for shuffling the current buffer.
+            if dist.is_initialized() and self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+                #  Create a tensor containing the local counter value
+                counter_tensor = torch.tensor(self.buffer_counter, dtype=torch.int64, device=self.device)
+                
+                # Broadcast the counter from Rank 0 to all others 
+                dist.broadcast(counter_tensor, src=0) 
+                
+                # Update the local counter on all ranks with the synchronized value
+                self.buffer_counter = counter_tensor.item()
+                
+            if self.shuffle:
+                g = torch.Generator()
+                # use the now-synchronized counter for the seed
+                g.manual_seed(42 + self.buffer_counter) 
+                
+                perm = torch.randperm(all_in.size(0), generator=g, device="cpu")
+                all_in, all_out = all_in[perm], all_out[perm]
+                if self.return_tokens:
+                    all_tokens = all_tokens[perm]
+            
+            # Increment the counter for the next time we rebuild
+            self.buffer_counter += 1
+
+            # Synchronize before any distributed operations
+            if dist.is_initialized() and self.world_size > 1:
+                dist.barrier()
+
+            if self.mix_with_previous_buffer:
+                split = all_in.size(0) // 2
+                self._storage_in, self._storage_out = all_in[:split], all_out[:split]
+                if self.return_tokens:
+                    self._storage_tokens = all_tokens[:split]
+            else: 
+                split = 0
+            
+            in_normed = all_in[split:] if self._skip_norm_application else self.apply_norm_scaling_factor_in(all_in[split:])
+            out_normed = all_out[split:] if self._skip_norm_application else self.apply_norm_scaling_factor_out(all_out[split:])
+
             if self.return_tokens:
-                all_tokens = all_tokens[perm]
-
-        if self.mix_with_previous_buffer:
-            split = all_in.size(0) // 2
-            self._storage_in, self._storage_out = all_in[:split], all_out[:split]
-            if self.return_tokens:
-                self._storage_tokens = all_tokens[:split]
-        else: 
-            split = 0
-        
-        # Apply normalization
-        in_normed = self.apply_norm_scaling_factor_in(all_in[split:])
-        out_normed = self.apply_norm_scaling_factor_out(all_out[split:])
-
-        if self.return_tokens:
-            dataset = TensorDataset(in_normed, out_normed, all_tokens[split:])
-        else:
-            dataset = TensorDataset(in_normed, out_normed)
-        loader = DataLoader(
-            dataset,
-            batch_size=self.cfg.train_batch_size_tokens,
-            shuffle=self.shuffle,
-            drop_last=False
-        )
-        self._yield_iter = iter(loader)
-
+                dataset = TensorDataset(in_normed, out_normed, all_tokens[split:])
+            else:
+                dataset = TensorDataset(in_normed, out_normed)
+            loader = DataLoader(
+                dataset,
+                batch_size=self.cfg.train_batch_size_tokens,
+                shuffle=False,
+                drop_last=True
+            )
+            self._yield_iter = iter(loader)
     # ───────────────────  normalization  ───────────────────
 
     @torch.no_grad()
@@ -320,60 +341,105 @@ class ActivationsStore:
         norms_per_layer_in = []
         norms_per_layer_out = []
 
-        self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, dtype = self.dtype, device="cpu")
-        self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, dtype = self.dtype, device="cpu")
+        self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, dtype=self.dtype, device="cpu")
+        self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, dtype=self.dtype, device="cpu")
 
-        for _ in tqdm(range(n_batches_for_norm_estimate), desc="Estimating norm scaling factor"):
-            if self.return_tokens:
-                _, acts_in, acts_out = next(iter(self))
-            else: 
-                acts_in, acts_out = next(iter(self))
-
-            assert acts_in.shape[1] == self.N_layers, \
-                f"Expected second dimension to be n_layers ({self.N_layers}), but got {acts_in.shape[1]}"
+        # 1. All ranks must consume data to ensure synchronization and buffer rebuilding.
+        # The 'disable=(self.rank != 0)' argument makes the progress bar visible only on Rank 0.
+        for _ in tqdm(range(n_batches_for_norm_estimate), 
+                      desc="Estimating norm scaling factor", 
+                      disable=(self.rank != 0)): 
             
-            norms_per_layer_in.append(acts_in.norm(dim=-1).mean(dim=0))
-            norms_per_layer_out.append(acts_out.norm(dim=-1).mean(dim=0))
+            # All ranks call the iterator to consume the batch. 
+            # This ensures internal buffer rebuild barriers are hit synchronously 
+            # and the data pointer (cache_ptr) is aligned across all GPUs.
+            acts_in, acts_out = next(iter(self))
 
-            # at end of loop iteration
+            # 2. Only Rank 0 calculates and stores the norms for averaging.
+            if self.rank == 0:
+                # Calculate the mean norm across the batch dimension (B*C) for each layer (N_layers)
+                norms_per_layer_in.append(acts_in.norm(dim=-1).mean(dim=0))
+                norms_per_layer_out.append(acts_out.norm(dim=-1).mean(dim=0))
+            
+            # Clean up the memory on all ranks after consumption.
             del acts_in, acts_out
-            torch.cuda.empty_cache()   # useful to debug; usually not needed in production
+            torch.cuda.empty_cache()
 
-        mean_norm_per_layer_in = torch.stack(norms_per_layer_in, dim=0).mean(dim=0)
-        mean_norm_per_layer_out = torch.stack(norms_per_layer_out, dim=0).mean(dim=0)
+        # 3. Only Rank 0 performs the final calculation after the loop.
+        if self.rank == 0:
+            mean_norm_per_layer_in = torch.stack(norms_per_layer_in, dim=0).mean(dim=0)
+            mean_norm_per_layer_out = torch.stack(norms_per_layer_out, dim=0).mean(dim=0)
+            
+            # The scaling factor is calculated to normalize the norm of the activations 
+            # to the square root of the input dimension (d_in ** 0.5)
+            self.estimated_norm_scaling_factor_in = (self.cfg.d_in ** 0.5) / mean_norm_per_layer_in
+            self.estimated_norm_scaling_factor_out = (self.cfg.d_in ** 0.5) / mean_norm_per_layer_out
 
-        logger.info(f"Estimated norm scaling factor in:{(self.cfg.d_in ** 0.5) / mean_norm_per_layer_in}")
-        logger.info(f"Estimated norm scaling factor out:{(self.cfg.d_in ** 0.5) / mean_norm_per_layer_out}")
+            logger.info(f"Estimated norm scaling factor in: {self.estimated_norm_scaling_factor_in}")
+            logger.info(f"Estimated norm scaling factor out: {self.estimated_norm_scaling_factor_out}")
 
-        return (self.cfg.d_in ** 0.5) / mean_norm_per_layer_in, (self.cfg.d_in ** 0.5) / mean_norm_per_layer_out
+        return self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out
+
+    # def estimate_norm_scaling_factor(self, n_batches_for_norm_estimate: int = 10):
+        
+    #     norms_per_layer_in = []
+    #     norms_per_layer_out = []
+
+    #     self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, dtype = self.dtype, device="cpu")
+    #     self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, dtype = self.dtype, device="cpu")
+
+    #     for _ in tqdm(range(n_batches_for_norm_estimate), desc="Estimating norm scaling factor"):
+    #         if self.return_tokens:
+    #             _, acts_in, acts_out = next(iter(self))
+    #         else: 
+    #             acts_in, acts_out = next(iter(self))
+
+    #         assert acts_in.shape[1] == self.N_layers, \
+    #             f"Expected second dimension to be n_layers ({self.N_layers}), but got {acts_in.shape[1]}"
+            
+    #         norms_per_layer_in.append(acts_in.norm(dim=-1).mean(dim=0))
+    #         norms_per_layer_out.append(acts_out.norm(dim=-1).mean(dim=0))
+
+    #         # at end of loop iteration
+    #         del acts_in, acts_out
+    #         torch.cuda.empty_cache()   # useful to debug; usually not needed in production
+
+    #     mean_norm_per_layer_in = torch.stack(norms_per_layer_in, dim=0).mean(dim=0)
+    #     mean_norm_per_layer_out = torch.stack(norms_per_layer_out, dim=0).mean(dim=0)
+
+    #     logger.info(f"Estimated norm scaling factor in:{(self.cfg.d_in ** 0.5) / mean_norm_per_layer_in}")
+    #     logger.info(f"Estimated norm scaling factor out:{(self.cfg.d_in ** 0.5) / mean_norm_per_layer_out}")
+
+    #     return (self.cfg.d_in ** 0.5) / mean_norm_per_layer_in, (self.cfg.d_in ** 0.5) / mean_norm_per_layer_out
     
     @torch.no_grad()
     def set_norm_scaling_factor_if_needed(self):
 
         if self.estimated_norm_scaling_factor_in is None or self.estimated_norm_scaling_factor_out is None:
-            if self.rank == 0:
-                self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out = self.estimate_norm_scaling_factor()
-            else:
-                dummy_shape = (self.N_layers,)
-                self.estimated_norm_scaling_factor_in = torch.empty(
-                    dummy_shape, dtype=self.dtype, device=self.device
-                )
-                self.estimated_norm_scaling_factor_out = torch.empty(
-                    dummy_shape, dtype=self.dtype, device=self.device
-                )
+            
+            #ALL ranks call estimate_norm_scaling_factor()
+            # This ensures all ranks consume the same batches, keeping data pointers aligned.
+            self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out = self.estimate_norm_scaling_factor()
+            
+            # --- Broadcast the calculated values (from my previous fixes) ---
+            if self.cfg.ddp or self.cfg.fsdp or self.world_size > 1:
+                
+                # Use a barrier to prevent deadlocks before the broadcast
+                dist.barrier() 
 
-            if self.cfg.ddp or self.cfg.fsdp: 
-                # is there a better way ???
-                self.estimated_norm_scaling_factor_in = self.estimated_norm_scaling_factor_in.to(self.device)
-                self.estimated_norm_scaling_factor_out = self.estimated_norm_scaling_factor_out.to(self.device)
+                # Prepare tensors for broadcast (move to device)
+                tensor_in = self.estimated_norm_scaling_factor_in.to(self.device)
+                tensor_out = self.estimated_norm_scaling_factor_out.to(self.device)
 
-                if self.cfg.ddp or self.cfg.fsdp:
-                    dist.broadcast(self.estimated_norm_scaling_factor_in, src=0)
-                    dist.broadcast(self.estimated_norm_scaling_factor_out, src=0)
+                dist.broadcast(tensor_in, src=0)
+                dist.broadcast(tensor_out, src=0)
 
-                # Move back to CPU once shared across instances
-                self.estimated_norm_scaling_factor_in = self.estimated_norm_scaling_factor_in.cpu()
-                self.estimated_norm_scaling_factor_out = self.estimated_norm_scaling_factor_out.cpu()
+                # Update the stored CPU tensors with the broadcasted values
+                self.estimated_norm_scaling_factor_in = tensor_in.cpu()
+                self.estimated_norm_scaling_factor_out = tensor_out.cpu()
+
+                del tensor_in, tensor_out # Clean up device memory
+
 
     def apply_norm_scaling_factor_in(self, activations: torch.Tensor) -> torch.Tensor:
         if self.estimated_norm_scaling_factor_in is None:
@@ -510,8 +576,10 @@ class ActivationsStore:
 
     def _load_cached_activations(self) -> None:
         if not hasattr(self, "split"):
-            self.split = self.rank 
-
+            # self.split = self.rank 
+            self.split = self.rank if (self.cfg.ddp or self.cfg.fsdp) else 0
+            
+        print(f"GPU {self.rank} loading split {self.split}")
         if self.cfg.cached_activations_path is None:
             raise ValueError("cached_activations_path must not be None here")
 
@@ -536,7 +604,8 @@ class ActivationsStore:
                     f"with {self.cached_act_in.shape[0]} samples "
                     f"from {activations_path}")
 
-        self.split += self.world_size
+        # self.split += self.world_size
+        self.split += self.world_size if (self.cfg.ddp or self.cfg.fsdp) else 1
         self.cache_ptr = 0
 
     # ───────────────────  public iterator  ───────────────────
