@@ -143,6 +143,7 @@ def main():
         cached_activations_path="/home/abir19/scratch/data/featflow/activations_gpt2_multilingual_20",
         n_train_batch_per_buffer=36,
         total_training_tokens=total_training_tokens,
+        gradient_accumulation_steps=4,
         train_batch_size_tokens=train_batch_size_tokens,
         adam_beta1=0.9,
         adam_beta2=0.999,

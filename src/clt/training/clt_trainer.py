@@ -343,12 +343,16 @@ class CLTTrainer():
                 print(f"Gradient norms: W_enc={grad_norms['W_enc']:.4f}, b_enc={grad_norms['b_enc']:.4f}, W_dec={grad_norms['W_dec']:.4f}")
 
     def _compute_training_step_loss(self, act_in: torch.Tensor, act_out: torch.Tensor, tokens: Optional[torch.Tensor] = None) -> LossMetrics:
-       
+    
         if self.n_training_steps < 5:
             print(f"GPU {self.rank} - act_in sum: {act_in.sum().item():.4f}, shape: {act_in.shape}")
 
-        self.optimizer.zero_grad()
-    
+        accumulation_steps = self.cfg.gradient_accumulation_steps
+        
+        # Only zero grad at the start or after optimizer step
+        if self.n_training_steps % accumulation_steps == 0:
+            self.optimizer.zero_grad()
+
         if self.scaler is not None:
             with autocast(device_type='cuda', dtype=torch.bfloat16):
                 loss, loss_metrics = self.clt(act_in, act_out, self.l0_scheduler.get_lr(), df_coef=self.cfg.dead_penalty_coef)
@@ -367,30 +371,39 @@ class CLTTrainer():
                 loss_str = ", ".join([f"gpu{i}: {l.item():.2f}" for i, l in enumerate(all_losses)])
                 print(f"Step {self.n_training_steps} - {loss_str}", flush=True)
         
+        # Scale loss for gradient accumulation
+        scaled_loss = loss / accumulation_steps
+        
         if self.scaler is not None:
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.clt.parameters(), 1.0)
+            self.scaler.scale(scaled_loss).backward()
             
-            # GRADIENT SYNCHRONIZATION
-            # if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
-            #     self._synchronize_feature_sharding_gradients() 
-            
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # Only step and sync every accumulation_steps
+            if (self.n_training_steps + 1) % accumulation_steps == 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.clt.parameters(), 1.0)
+                
+                # GRADIENT SYNCHRONIZATION
+                if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+                    self._synchronize_feature_sharding_gradients() 
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
         else:
-            loss.backward()
+            scaled_loss.backward()
             
-            # GRADIENT SYNCHRONIZATION
-            # if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
-            #     self._synchronize_feature_sharding_gradients()
-                    
-            self.optimizer.step()
+            # Only step and sync every accumulation_steps
+            if (self.n_training_steps + 1) % accumulation_steps == 0:
+                # GRADIENT SYNCHRONIZATION
+                if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+                    self._synchronize_feature_sharding_gradients()
+                            
+                self.optimizer.step()
 
-        self._log_debug_info(loss_metrics)
-
+        # Call schedulers EVERY step (for proper step counting)
         self.update_optimizer_lr()
         self.l0_scheduler.step()
+        
+        self._log_debug_info(loss_metrics)
         return loss_metrics
 
     def update_optimizer_lr(self) -> float:
