@@ -1,9 +1,15 @@
+import os
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent.parent / "src"
+sys.path.insert(0, str(project_root))
+
 import torch
 from clt.config.clt_training_runner_config import CLTTrainingRunnerConfig
 from clt.transformer_lens.multilingual_patching import patch_official_model_names, patch_convert_hf_model_config
 from clt.training.activations_store import ActivationsStore
 from clt.load_model import load_model
-import sys 
+
 
 total_training_steps = 1000
 train_batch_size_tokens = 2048
@@ -57,7 +63,7 @@ cfg = CLTTrainingRunnerConfig(
     l0_warm_up_steps=l0_warm_up_steps,
     log_to_wandb=True,
     wandb_project="gpt2-clt-multilingual-"+MODEL_PERCENTAGE,
-    wandb_id=None,
+    wandb_id='0',
     wandb_log_frequency=10,
     eval_every_n_wandb_logs=100,
     run_name=None,
@@ -82,7 +88,7 @@ activations_store = ActivationsStore(
 )
 
 activations_store.generate_and_save_activations(
-    path="/home/abir19/scratch/data/featflow/activations_gpt2_multilingual_"+MODEL_PERCENTAGE, 
+    path="../data/activations_gpt2_multilingual_"+MODEL_PERCENTAGE, 
     split_count=TOTAL_SPLITS, 
     number_of_tokens=150994944,  # 1024^2 x 144
     split_begin_idx=split_begin_idx,  # Add this

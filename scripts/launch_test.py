@@ -1,4 +1,9 @@
 import os
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent.parent / "src"
+sys.path.insert(0, str(project_root))
+
 import torch
 import torch.distributed as dist
 from clt.config.clt_training_runner_config import CLTTrainingRunnerConfig
