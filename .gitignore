@@ -24,6 +24,7 @@ tests/ckpts_ddp/
 # cache
 cache/ 
 **/cache/
+__pycache__/
 
 # save
 save/
@@ -31,3 +32,6 @@ save/
 
 # claude
 CLAUDE.md
+
+# data
+data/

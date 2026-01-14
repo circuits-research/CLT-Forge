@@ -25,6 +25,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     dataset_path: str = "" # Hugging face path
     is_dataset_tokenized: bool = True
     is_multilingual_split_dataset: bool = False
+    monolingual_language: Optional[str] = "eng"
 
     # -----CLT parameters---------------------
     from_pretrained_path: str | None = None
@@ -111,7 +112,8 @@ class CLTTrainingRunnerConfig(BaseModel):
     @model_validator(mode="after")
     def validate_ddp_and_device(cls, cfg: "CLTTrainingRunnerConfig") -> "CLTTrainingRunnerConfig":
         if cfg.ddp:
-            if not torch.cuda.is_available() or not cfg.device == "cuda":
+            # Check if device starts with "cuda" (accepts "cuda", "cuda:0", "cuda:1", etc.)
+            if not torch.cuda.is_available() or not cfg.device.startswith("cuda"):
                 raise ValueError(
                     "DDP is enabled but CUDA is not available or not selected."
                 )
@@ -150,7 +152,7 @@ class CLTTrainingRunnerConfig(BaseModel):
             raise ValueError("wandb_id must be provided")  # Force explicit
         
         base_path = values.get("checkpoint_path", "checkpoints")
-        values["checkpoint_path"] = f"{base_path}/{wandb_id}"
+        values["checkpoint_path"] = f"{base_path}/{wandb_id}"  # Creates checkpoints/my_run_id/
         return values
     
     @model_validator(mode="before")

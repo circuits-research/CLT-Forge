@@ -1,3 +1,4 @@
+import os
 import wandb
 from typing import Any, cast, Union
 from pathlib import Path
@@ -16,7 +17,7 @@ from clt.clt import CLT
 from clt.load_model import load_model
 from clt.training.activations_store import ActivationsStore
 from clt.training.clt_trainer import CLTTrainer
-import os
+from clt import logger
 
 _missing = object()
 
@@ -52,6 +53,9 @@ class CLTTrainingRunner:
 
         self.is_main_process = True if self.rank == 0 else False
         self.device = torch.device(self.cfg.device)
+        
+        # Log to verify
+        logger.info(f"Rank {self.rank}: Initializing CLT on device {self.cfg.device}")
 
         # For multlingual models added to transformer-lens
         if self.cfg.is_multilingual_split_dataset: 
@@ -120,8 +124,12 @@ class CLTTrainingRunner:
                 rank=self.rank,
                 world_size=self.world_size
             )
+            # Ensure it's on the correct device
+            self.clt = self.clt.to(self.device)
+            logger.info(f"Rank {self.rank}: CLT created and moved to {self.device}")
 
         if self.ddp:
+            logger.info(f"Rank {self.rank}: Wrapping CLT with DDP")
             self.clt = torch.nn.parallel.DistributedDataParallel(
                 self.clt,
                 device_ids=[self.rank],
@@ -169,7 +177,8 @@ class CLTTrainingRunner:
             rank=self.rank, 
             world_size=self.world_size
         )
-
+        
+        logger.info("Start training...")
         clt = trainer.fit()
 
         if self.cfg.log_to_wandb and self.is_main_process:

@@ -70,6 +70,7 @@ class CLT(nn.Module):
         )
         self.max_layers_out = int(self.N_layers_out.max().item())
 
+        # All parameters are created on init_device
         self.W_enc = nn.Parameter(torch.empty(self.N_layers, self.d_in, self.local_d_latent, dtype=self.dtype, device=init_device))
         self.b_enc = nn.Parameter(torch.zeros(self.N_layers, self.local_d_latent, dtype=self.dtype, device=init_device))
 
@@ -154,7 +155,7 @@ class CLT(nn.Module):
                     bias_values[layer, feature] = required_bias
             
             self.b_enc.data = bias_values.to(self.device)
-            logger.info(f"Initialized b_enc with target activation rate {target_activation_rate:.6f}", flush=True)
+            logger.info(f"Initialized b_enc with target activation rate {target_activation_rate:.6f}")
             
             # # Verify the initialization by computing actual activation rates
             # feat_act, _ = self.encode(x)            
