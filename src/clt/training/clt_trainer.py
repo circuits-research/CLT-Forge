@@ -2,9 +2,10 @@ from typing import Dict, Callable, Optional
 import wandb
 import logging
 import torch
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from torch.optim import Adam
 
+from clt.utils import DTYPE_MAP
 from clt.clt import CLT
 from clt.training.activations_store import ActivationsStore
 from clt.training.optim import LearningRateScheduler
@@ -15,7 +16,7 @@ import torch.distributed as dist
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-class CLTTrainer(): 
+class CLTTrainer():
     """
     * Trainer class for fitting a clt using activations from an activations_store.
     """
@@ -25,8 +26,8 @@ class CLTTrainer():
         clt: CLT,
         activations_store: ActivationsStore,
         cfg: CLTTrainingRunnerConfig,
-        save_checkpoint_fn: Callable[["CLTTrainer", str], None], 
-        rank: int = 0, 
+        save_checkpoint_fn: Callable[["CLTTrainer", str], None],
+        rank: int = 0,
         world_size: int = 1
     ) -> None:
         self.world_size = world_size
@@ -52,9 +53,9 @@ class CLTTrainer():
             cfg.lr_warm_up_type,
             cfg.lr,
             cfg.total_training_steps,
-            cfg.lr_warm_up_steps, 
+            cfg.lr_warm_up_steps,
             lr_decay_steps = cfg.lr_decay_steps,
-            final_lr_scale = cfg.final_lr_scale, 
+            final_lr_scale = cfg.final_lr_scale,
             decay_stable = cfg.decay_stable_steps
         )
 
@@ -65,7 +66,7 @@ class CLTTrainer():
             cfg.l0_warm_up_steps,
             lr_waiting_steps = cfg.l0_waiting_steps
         )
-            
+
         self.optimizer = Adam(
             self.clt.parameters(),
             lr=cfg.lr,
@@ -75,36 +76,47 @@ class CLTTrainer():
             ),
         )
 
-        if self.cfg.use_mixed_precision and self.cfg.device != "cpu":
-            self.scaler = GradScaler('cuda')
-        else:
-            self.scaler = None
+        #PRECISION: AutoCast and GradScaler configuration
+        self.dtype = DTYPE_MAP[self.cfg.dtype]
+        self.device_type = "cuda" if "cuda" in str(self.cfg.device) else "cpu"
+        self.use_autocast = (
+            self.dtype in {torch.float16, torch.bfloat16}
+            and self.device_type == "cuda"
+        )
+        self.use_scaler = (
+            self.dtype == torch.float16
+            and self.device_type == "cuda"
+        )
+        self.autocast_dtype = self.dtype if self.use_autocast else None
+        self.scaler = GradScaler() if self.use_scaler else None
 
         self.n_tokens: int = 0
         self.monitoring_l0 = None
 
-    def _initialize_b_enc(self, n_batches: int = 10): 
+    def _initialize_b_enc(self, n_batches: int = 10):
 
         x = []
         for _ in range(n_batches):
             # consume data synchronously
             acts_in, _ = (t.to(self.cfg.device) for t in next(self.activations_store.__iter__()))
-            
+            #PRECISION: cast activations to encoder weight dtype
             with torch.no_grad():
-                clt_model = self._get_clt()
-                hidden_pre = torch.einsum("bnd,ndk->bnk", acts_in, clt_model.W_enc).detach().to("cpu")
-            
+                if self.cfg.is_distributed:
+                    hidden_pre = torch.einsum("bnd,ndk->bnk", acts_in.to(self.clt.W_enc.dtype), self.clt.module.W_enc).detach().to("cpu")
+                else:
+                    hidden_pre = torch.einsum("bnd,ndk->bnk", acts_in.to(self.clt.W_enc.dtype), self.clt.W_enc).detach().to("cpu")
+
             x.append(hidden_pre)
 
         x = torch.cat(x, dim=0)
-                    
+
         if self.cfg.ddp:
             if self.is_main_process:
-                self.clt.module._initialize_b_enc(x) 
-                
+                self.clt.module._initialize_b_enc(x)
+
             torch.distributed.barrier()
             torch.distributed.broadcast(self.clt.module.b_enc.data, src=0)
-        
+
         elif self.cfg.fsdp:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -114,107 +126,98 @@ class CLTTrainer():
                     self.clt.module._initialize_b_enc(x)
 
             torch.distributed.barrier()
-            
-        else:  
+
+        else:
             self.clt._initialize_b_enc(x)
-            
+
             if self.cfg.is_sharded:
                 torch.distributed.barrier()
 
     def _synchronize_feature_sharding_gradients(self):
         """Manually performs all_reduce(AVG) on non-sharded parameters (b_enc, b_dec) in Feature Sharding mode."""
-        
+
         if not self.cfg.is_sharded:
             raise ValueError("This function should not be used if feature_sharding is False.")
 
         b_enc_param = self.clt.b_enc
         b_dec_param = self.clt.b_dec
-        
+
         # if b_enc_param.grad is not None:
         #     dist.all_reduce(b_enc_param.grad.data, op=dist.ReduceOp.AVG)
-        
-        # TODO: is it necessary, if so, why ? 
+
+        # TODO: is it necessary, if so, why ?
         if b_dec_param.grad is not None:
             dist.all_reduce(b_dec_param.grad.data, op=dist.ReduceOp.AVG)
-            
+
         dist.barrier()
 
-    def _get_clt(self) -> CLT:
-        """Get the unwrapped CLT model."""
-        if self.cfg.is_distributed:
-            return self.clt.module
-        else:
+    def fit(self):
+            """ fit a clt """
+
+            # start_func_finetuning = True
+            if self.cfg.from_pretrained_path is None:
+                self._initialize_b_enc()
+
+            logger.info(f"GPU {self.rank} - b_enc mean: {self.clt.b_enc.mean().item():.4f}, b_enc sum: {self.clt.b_enc.sum().item():.4f}")
+
+            while self.n_tokens < self.cfg.total_training_tokens:
+
+                *tokens_part, acts_in, acts_out = (
+                    t.to(device=self.cfg.device)
+                    for t in next(self.activations_store.__iter__())
+                )
+
+                if self.cfg.check_activations_across_ranks_are_equal and self.cfg.is_sharded:
+                    self.check_activations_across_ranks_are_equal()
+
+                loss_metrics = self._compute_training_step_loss(
+                    acts_in,
+                    acts_out,
+                    tokens_part[0] if len(tokens_part) > 0 else None
+                )
+
+                self.n_tokens += self.cfg.train_batch_size_tokens
+                self.n_training_steps += 1
+                if self.is_main_process:
+                    self._log_train_step(loss_metrics)
+                    self._run_and_log_evals()
+                self._checkpoint_if_needed()
+
+                # if self.cfg.functional_loss is not None and self.fc_scheduler.get_lr() > 0 and start_func_finetuning:
+                #     self._enable_functional_training()
+                #     start_func_finetuning = False
+
+                if self.cfg.checkpoint_l0 is not None and self.monitoring_l0 is not None:
+                    if self.monitoring_l0 < self.cfg.checkpoint_l0[0]:
+
+                        self.save_checkpoint_fn(
+                            trainer=self,
+                            checkpoint_name=f"middle_{self.n_tokens}",
+                        )
+                        if self.is_main_process:
+                            self.cfg.checkpoint_l0.pop(0)
+
+                if self.cfg.optimal_l0 is not None and self.monitoring_l0 is not None:
+                    if self.monitoring_l0 < self.cfg.optimal_l0:
+                        logger.info(
+                            f"Stopping training at current l0 {self.monitoring_l0}"
+                        )
+                        break
+
+                del acts_in, acts_out, tokens_part
+                torch.cuda.empty_cache()
+
+            self.save_checkpoint_fn(
+                trainer=self,
+                checkpoint_name=f"final_{self.n_tokens}",
+            )
+
             return self.clt
 
-    def fit(self): 
-        """ fit a clt """
-        
-        # start_func_finetuning = True
-        if self.cfg.from_pretrained_path is None:
-            self._initialize_b_enc()
-        
-        # Use helper method to access b_enc
-        clt_model = self._get_clt()
-        logger.info(f"GPU {self.rank} - b_enc mean: {clt_model.b_enc.mean().item():.4f}, b_enc sum: {clt_model.b_enc.sum().item():.4f}")
-        
-        while self.n_tokens < self.cfg.total_training_tokens: 
-            logger.info(f"{self.n_tokens} / {self.cfg.total_training_tokens} tokens processed.")
-            *tokens_part, acts_in, acts_out = (
-                t.to(device=self.cfg.device) 
-                for t in next(self.activations_store.__iter__())
-            )
-
-            if self.cfg.check_activations_across_ranks_are_equal and self.cfg.is_sharded: 
-                self.check_activations_across_ranks_are_equal()
-
-            loss_metrics = self._compute_training_step_loss(
-                acts_in, 
-                acts_out, 
-                tokens_part[0] if len(tokens_part) > 0 else None
-            )
-
-            self.n_tokens += self.cfg.train_batch_size_tokens
-            self.n_training_steps += 1
-            if self.is_main_process:
-                self._log_train_step(loss_metrics)
-                self._run_and_log_evals()
-            self._checkpoint_if_needed()
-
-            # if self.cfg.functional_loss is not None and self.fc_scheduler.get_lr() > 0 and start_func_finetuning: 
-            #     self._enable_functional_training()
-            #     start_func_finetuning = False
-
-            if self.cfg.checkpoint_l0 is not None and self.monitoring_l0 is not None:
-                if self.monitoring_l0 < self.cfg.checkpoint_l0[0]: 
-                     
-                    self.save_checkpoint_fn(
-                        trainer=self,
-                        checkpoint_name=f"middle_{self.n_tokens}",
-                    )
-                    if self.is_main_process:
-                        self.cfg.checkpoint_l0.pop(0)
-
-            if self.cfg.optimal_l0 is not None and self.monitoring_l0 is not None: 
-                if self.monitoring_l0 < self.cfg.optimal_l0: 
-                    logger.info(
-                        f"Stopping training at current l0 {self.monitoring_l0}"
-                    )
-                    break
-
-            del acts_in, acts_out, tokens_part
-            torch.cuda.empty_cache()
-
-        self.save_checkpoint_fn(
-            trainer=self,
-            checkpoint_name=f"final_{self.n_tokens}",
-        )
-
-        return self.clt
-
-    def check_activations_across_ranks_are_equal(self, acts_in: torch.Tensor): 
+    def check_activations_across_ranks_are_equal(self, acts_in: torch.Tensor):
 
         # Use first value to check
-        local_val = acts_in[0, 0, 0].detach().clone() 
+        local_val = acts_in[0, 0, 0].detach().clone()
         gathered_vals = [torch.zeros_like(local_val) for _ in range(self.world_size)]
         dist.all_gather(gathered_vals, local_val)
 
@@ -225,41 +228,40 @@ class CLTTrainer():
                     f"Rank 0 input: {ref_val.item():.6f}\n"
                     f"The GPUs are processing different data batches. Check ActivationsStore barriers.")
             logger.error(err_msg)
-            raise RuntimeError(err_msg)   
+            raise RuntimeError(err_msg)
 
     def _log_debug_info(self, loss_metrics: LossMetrics):
         """Log activation and gradient norms across GPUs."""
         if self.n_training_steps % 100 != 0:
             return
-        
+
         sparsity = (loss_metrics.feature_acts == 0).float().mean().item()
         if self.rank == 0:
             logger.info(f"Feature sparsity: {sparsity:.4f}")
 
-        clt_model = self._get_clt()
-        logger.info(f"Rank {self.rank}: W_dec[0,0,0] = {clt_model.W_dec[0,0,0].item():.6f}")
-        if clt_model.W_dec.grad is not None:
-            logger.info(f"Rank {self.rank}: W_dec.grad[0,0,0] = {clt_model.W_dec.grad[0,0,0].item():.6f}")
+        logger.info(f"Rank {self.rank}: W_dec[0,0,0] = {self.clt.W_dec[0,0,0].item():.6f}")
+        if self.clt.W_dec.grad is not None:
+            logger.info(f"Rank {self.rank}: W_dec.grad[0,0,0] = {self.clt.W_dec.grad[0,0,0].item():.6f}")
         else:
             logger.info(f"Rank {self.rank}: W_dec.grad is None")
 
         feat_act = loss_metrics.feature_acts  # [B, N_layers, local_d_latent]
-        
+
         local_sq_norm_per_layer = feat_act.pow(2).sum(dim=(0, 2))  # [N_layers]
-        
+
         if self.cfg.uses_process_group:
             # Gather the local SQUARED norms from all GPUs.
             all_sq_norms_list = [
-                torch.zeros_like(local_sq_norm_per_layer) 
+                torch.zeros_like(local_sq_norm_per_layer)
                 for _ in range(self.world_size)
             ]
             dist.all_gather(all_sq_norms_list, local_sq_norm_per_layer.contiguous())
-            
+
             global_sq_norm_per_layer = sum(all_sq_norms_list)
             global_norm_per_layer = torch.sqrt(global_sq_norm_per_layer + 1e-12)
             final_logged_norm = global_norm_per_layer.mean().item()
             act_norms_per_layer = global_norm_per_layer
-            
+
             if self.rank == 0:
                 logger.info(f"\nStep {self.n_training_steps}")
                 logger.info(f"Activation norms per GPU (Local Shard Norms):")
@@ -273,25 +275,29 @@ class CLTTrainer():
             if self.rank == 0:
                 logger.info(f"\nStep {self.n_training_steps}")
                 logger.info(f"Activation norms: {act_norms_per_layer}")
-        
+
         # Gradient norms per parameter type
-        clt_model = self._get_clt()
-        W_enc = clt_model.W_enc
-        b_enc = clt_model.b_enc
-        W_dec = clt_model.W_dec
-        
+        if self.cfg.is_distributed:
+            W_enc = self.clt.module.W_enc
+            b_enc = self.clt.module.b_enc
+            W_dec = self.clt.module.W_dec
+        else:
+            W_enc = self.clt.W_enc
+            b_enc = self.clt.b_enc
+            W_dec = self.clt.W_dec
+
         grad_norms = {
             "W_enc": W_enc.grad.norm().item() if W_enc.grad is not None else 0.0,
             "b_enc": b_enc.grad.norm().item() if b_enc.grad is not None else 0.0,
             "W_dec": W_dec.grad.norm().item() if W_dec.grad is not None else 0.0,
         }
-        
+
         if self.cfg.uses_process_group:
 
             grad_norm_tensor = torch.tensor([grad_norms["W_enc"], grad_norms["b_enc"], grad_norms["W_dec"]], device=self.cfg.device)
             all_grad_norms = [torch.zeros_like(grad_norm_tensor) for _ in range(self.world_size)]
             dist.all_gather(all_grad_norms, grad_norm_tensor.contiguous())
-            
+
             if self.rank == 0:
                 logger.info(f"Gradient norms per GPU:")
                 for gpu_id in range(self.world_size):
@@ -302,39 +308,63 @@ class CLTTrainer():
                 logger.info(f"Gradient norms: W_enc={grad_norms['W_enc']:.4f}, b_enc={grad_norms['b_enc']:.4f}, W_dec={grad_norms['W_dec']:.4f}")
 
     def _compute_training_step_loss(self, act_in: torch.Tensor, act_out: torch.Tensor, tokens: Optional[torch.Tensor] = None) -> LossMetrics:
-       
+
+        if self.n_training_steps < 5:
+            logger.info(f"GPU {self.rank} - act_in sum: {act_in.sum().item():.4f}, shape: {act_in.shape}")
+
         self.optimizer.zero_grad()
-    
-        # Forward pass - your logging happens HERE
-        loss, loss_metrics = self.clt(act_in, act_out, self.l0_scheduler.get_lr(), df_coef=self.cfg.dead_penalty_coef)
-        # ↑ At this point: requires_grad=True, but has grad=False (no backward yet)
-        
-        # Backward pass - gradients are created HERE
-        if self.scaler is not None:
+
+        #PRECISION: AutoCast vs GradScaler backprop
+        if self.use_autocast:
+            with torch.autocast(
+                device_type = self.device_type,
+                dtype = self.autocast_dtype,
+            ):
+                loss, loss_metrics = self.clt(
+                    act_in,
+                    act_out,
+                    self.l0_scheduler.get_lr(),
+                    df_coef=self.cfg.dead_penalty_coef
+                )
+        else:
+            loss, loss_metrics = self.clt(
+                act_in,
+                act_out,
+                self.l0_scheduler.get_lr(),
+                df_coef=self.cfg.dead_penalty_coef,
+            )
+
+        if self.n_training_steps == 0 and self.rank == 0:
+            logger.info(f"feat_act shape: {loss_metrics.feature_acts.shape}")
+            logger.info(f"act_pred shape: {loss_metrics.act_pred.shape}")
+
+        if self.n_training_steps % 100 == 0 and self.world_size > 1:
+            loss_tensor = loss_metrics.mse_loss.detach()
+            all_losses = [torch.zeros_like(loss_tensor) for _ in range(self.world_size)]
+            dist.all_gather(all_losses, loss_tensor.contiguous())
+            if self.rank == 0:
+                loss_str = ", ".join([f"gpu{i}: {l.item():.2f}" for i, l in enumerate(all_losses)])
+                logger.info(f"Step {self.n_training_steps} - {loss_str}", flush=True)
+
+        if self.use_scaler:
             self.scaler.scale(loss).backward()
-            
-            # Log gradients AFTER backward
-            if self.n_training_steps == 0:
-                clt_model = self._get_clt()
-                logger.info(f"[AFTER BACKWARD] Rank {self.rank}: W_dec has grad = {clt_model.W_dec.grad is not None}")
-                if clt_model.W_dec.grad is not None:
-                    logger.info(f"[AFTER BACKWARD] Rank {self.rank}: W_dec grad norm = {clt_model.W_dec.grad.norm().item():.6f}")
-        
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.clt.parameters(), 1.0)
-            
-            if self.cfg.is_sharded:
-                self._synchronize_feature_sharding_gradients() 
-            
-            self.scaler.step(self.optimizer)  # ← Model updated HERE
-            self.scaler.update()
-        else:
-            loss.backward()  # ← Gradients created NOW
-            
+
             if self.cfg.is_sharded:
                 self._synchronize_feature_sharding_gradients()
-                    
-            self.optimizer.step()  # ← Model updated HERE
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(self.clt.parameters(), 1.0)
+
+            if self.cfg.is_sharded:
+                self._synchronize_feature_sharding_gradients()
+
+            self.optimizer.step()
 
         self._log_debug_info(loss_metrics)
 
@@ -347,7 +377,7 @@ class CLTTrainer():
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = current_lr
         return current_lr
-        
+
     @torch.no_grad()
     def _log_train_step(self, loss_metrics: LossMetrics):
         if (
@@ -359,7 +389,7 @@ class CLTTrainer():
                 step=self.n_tokens * self.world_size,
             )
 
-    def _build_train_step_log_dict(self, loss_metrics: LossMetrics) -> Dict: 
+    def _build_train_step_log_dict(self, loss_metrics: LossMetrics) -> Dict:
         act_in = loss_metrics.act_in
         act_out = loss_metrics.act_out
         feature_acts = loss_metrics.feature_acts
@@ -368,17 +398,17 @@ class CLTTrainer():
 
         if self.cfg.is_distributed:
             dead_features_per_layer = self.clt.module.get_dead_features().sum(dim=1)
-        else: 
+        else:
             dead_features_per_layer = self.clt.get_dead_features().sum(dim=1)
-        
+
         dead_features_average_count = dead_features_per_layer.float().mean()
 
         # metrics for currents acts
         l0_across_layers = (feature_acts > 0).float().sum(-1).mean(0)
         l0 = l0_across_layers.mean()
         current_learning_rate = self.optimizer.param_groups[0]["lr"]
-        per_token_l2_loss = (act_out - act_pred).pow(2).sum(dim=-1) # shape 
-        total_variance = (act_out - act_out.mean(0)).pow(2).sum(dim=-1) # shape 
+        per_token_l2_loss = (act_out - act_pred).pow(2).sum(dim=-1) # shape
+        total_variance = (act_out - act_out.mean(0)).pow(2).sum(dim=-1) # shape
         explained_variance_across_layers = 1 - per_token_l2_loss.mean(0) / total_variance.mean(0)
         explained_variance = explained_variance_across_layers.mean()
         normalized_mse = 1 - explained_variance
@@ -408,7 +438,7 @@ class CLTTrainer():
             "details/n_training_tokens": self.n_tokens * self.world_size,
         }
 
-        for l in range(len(l0_across_layers)): 
+        for l in range(len(l0_across_layers)):
             log_dict[f"dead_features/layer_{l}"] = dead_features_per_layer[l].item()
             log_dict[f"explained_variance/layer_{l}"] = explained_variance_across_layers[l].item()
             log_dict[f"sparsity/layer_{l}"] = l0_across_layers[l].item()
@@ -419,7 +449,7 @@ class CLTTrainer():
         #     # Log individual position accuracies
         #     context_size = len(loss_metrics.pred_per)
         #     for pos in range(context_size):
-        #         log_dict[f"metrics/next_token_per_pos_{pos}"] = loss_metrics.pred_per[pos].item()            
+        #         log_dict[f"metrics/next_token_per_pos_{pos}"] = loss_metrics.pred_per[pos].item()
 
         # # Create metrics dictionary for layer-wise tracking
         # layer_metrics = {
@@ -433,14 +463,14 @@ class CLTTrainer():
             loss_metrics.l0_loss / (self.l0_scheduler.get_lr())
         )
         log_dict["losses/l0_loss"] = loss_metrics.l0_loss
-        log_dict["losses/mse_loss"] = loss_metrics.mse_loss 
+        log_dict["losses/mse_loss"] = loss_metrics.mse_loss
         log_dict["losses/dead_loss"] = loss_metrics.dead_feature_loss
         # log_dict["losses/hybrid_loss"] = loss_metrics.hybrid_loss
 
         return log_dict
 
-    def _run_and_log_evals(self): 
-        pass 
+    def _run_and_log_evals(self):
+        pass
 
 
     @torch.no_grad()
@@ -461,29 +491,31 @@ class CLTTrainer():
         log_dict: Dict,
         metrics_dict: Dict[str, torch.Tensor],
     ) -> Dict:
-        
-        clt_model = self._get_clt()
-        num_layers = clt_model.module.N_layers
+
+        if self.cfg.is_distributed:
+            num_layers = self.clt.module.N_layers
+        else:
+            num_layers = self.clt.N_layers
         current_step = self.n_tokens * self.world_size
-        
+
         # Initialize history trackers if they don't exist yet
         if not hasattr(self, "history_steps"):
             self.history_steps = []
-            self.history_metrics: Dict[str, list[list[float]]] = {}  
+            self.history_metrics: Dict[str, list[list[float]]] = {}
 
         self.history_steps.append(current_step)
-        
+
         for metric_name, layer_values in metrics_dict.items():
             if metric_name not in self.history_metrics:
                 self.history_metrics[metric_name] = [[] for _ in range(num_layers)]
-        
+
             for i in range(num_layers):
                 self.history_metrics[metric_name][i].append(layer_values[i].item())
-        
+
         for metric_name, history in self.history_metrics.items():
             # Convert metric name to snake_case for log key
             plot_key = f"{metric_name.lower().replace(' ', '_')}_over_time"
-            
+
             log_dict[plot_key] = wandb.plot.line_series(  # type: ignore[attr-defined]
                 xs=self.history_steps,
                 ys=history,
@@ -491,7 +523,7 @@ class CLTTrainer():
                 title=metric_name,
                 xname="Tokens"
             )
-        
+
         return log_dict
 
     # def _enable_functional_training(self):
@@ -499,21 +531,21 @@ class CLTTrainer():
 
     #     if self.cfg.ddp or self.cfg.fsdp:
     #         self.clt.module.attach_model_for_replacement(
-    #             self.cfg.model_class_name, 
-    #             self.cfg.model_name, 
-    #             torch.device(self.cfg.device), 
+    #             self.cfg.model_class_name,
+    #             self.cfg.model_name,
+    #             torch.device(self.cfg.device),
     #             self.cfg.model_from_pretrained_kwargs
     #         )
-    #     else: 
-    #         self.clt.attach_model_for_replacement(ens = True
-    #             self.cfg.model_class_name,  False
-    #             self.cfg.model_name, .activations_store.rank
-    #             torch.device(self.cfg.device), ld_buffers()
-    #             self.cfg.model_from_pretrained_kwargs    #         )    #     self.activations_store.shuffle = False    #     if self.cfg.ddp or self.cfg.fsdp:    #         self.clt.module.attach_model_for_replacement(    #             self.cfg.model_class_name,     #             self.cfg.model_name,     #             torch.device(self.cfg.device),     #             self.cfg.model_from_pretrained_kwargs    #         )    #     else:     #         self.clt.attach_model_for_replacement(    #             self.cfg.model_class_name,     #             self.cfg.model_name,     #             torch.device(self.cfg.device),     #             self.cfg.model_from_pretrained_kwargs
+    #     else:
+    #         self.clt.attach_model_for_replacement(
+    #             self.cfg.model_class_name,
+    #             self.cfg.model_name,
+    #             torch.device(self.cfg.device),
+    #             self.cfg.model_from_pretrained_kwargs
     #         )
 
     #     self.activations_store.shuffle = False
     #     self.activations_store.return_tokens = True
     #     self.activations_store.mix_with_previous_buffer = False
     #     self.activations_store.split = self.activations_store.rank
-    #     self.activations_store._rebuild_buffers()
+    #     self.activations_s
