@@ -433,10 +433,27 @@ class ActivationsStore:
 
     # ------------------ Generate activations, save to and load from disk ------------------
 
-    def generate_and_save_activations(self, path: str, split_count: int = 10, number_of_tokens: Optional[int] = None, split_begin_idx: int = 0, split_end_idx: Optional[int] = None):
+    def generate_and_save_activations(self, path: str, split_count: int = 10, number_of_tokens: Optional[int] = None, split_begin_idx: int = 0, split_end_idx: Optional[int] = None, use_compression: bool = False,  compression_config: Optional['CompressionConfig'] = None,):
         """
         path - directory where splits will be saved with name activations_ctx_{self.context_size}_split_{split_idx}.safetensors
         """
+
+        compression_store = None
+        if use_compression:
+            from clt.training.compressed_activations_store import (
+                CompressionConfig,
+                CompressedActivationsStore,
+            )
+        
+        if compression_config is None:
+            compression_config = CompressionConfig(
+                quantization="int8",
+                compression="zstd",
+                compression_level=3,
+            )
+        
+        compression_store = CompressedActivationsStore(compression_config)
+        logger.info(f"[ActivationsStore] Using compression: {compression_config.quantization} + {compression_config.compression}")
         # Set default value for split_end_idx
         if split_end_idx is None:
             split_end_idx = split_count
@@ -490,11 +507,25 @@ class ActivationsStore:
 
                 buffer_idx += 1
 
-            split_path = activation_split_path(save_path, self.context_size, split_idx, must_exist=False)
-            save_file({"act_in": acts_in, "act_out": acts_out, "tokens": tokens}, split_path)
-            logger.info(f"[ActivationsStore] Saved split {split_idx + 1}/{split_count} to {split_path}")
-
-        logger.info(f"[ActivationsStore] Finished saving all {split_count} splits to {save_path}")
+            if use_compression:
+                # Save compressed (new format)
+                split_path = save_path / f"ctx_{self.context_size}" / f"activations_ctx_{self.context_size}_split_{split_idx}.bin"
+                file_size = compression_store.save_compressed(
+                    path=split_path,
+                    act_in=acts_in,
+                    act_out=acts_out,
+                    tokens=tokens,
+                )
+                compression_ratio = (acts_in.numel() * acts_in.element_size() * 2) / file_size  # 2 for in+out
+                logger.info(f"[ActivationsStore] Saved compressed split {split_idx + 1}/{split_count}: "
+                            f"{file_size / 1024 / 1024:.2f} MB ({compression_ratio:.2f}x compression)")
+            else:
+                # Save uncompressed (original format)
+                split_path = activation_split_path(save_path, self.context_size, split_idx, must_exist=False)
+                save_file({"act_in": acts_in, "act_out": acts_out, "tokens": tokens}, split_path)
+                logger.info(f"[ActivationsStore] Saved split {split_idx + 1}/{split_count} to {split_path}")
+            
+                    logger.info(f"[ActivationsStore] Finished saving all {split_count} splits to {save_path}")
 
     def _load_buffer_from_cached(self, return_tokens:bool = False) -> tuple[torch.Tensor, ...]:
         
@@ -542,27 +573,49 @@ class ActivationsStore:
         logger.info(f"GPU {self.rank} loading split {self.split}")
         if self.cfg.cached_activations_path is None:
             raise ValueError("cached_activations_path must not be None here")
-
-        activations_path = activation_split_path(self.cfg.cached_activations_path, self.context_size, self.split)
         
-        # If it doesn't exist, restart from 0
-        if not os.path.exists(activations_path):
-            logger.info(f"[ActivationsStore] No split at {activations_path}, restarting from split {self.rank}")
-            self.split = self.rank
-            activations_path = activation_split_path(self.cfg.cached_activations_path, self.context_size, self.split)
-            if not os.path.exists(activations_path):
-                raise FileNotFoundError(f"No cached activations found at {activations_path}")
+        base_path = Path(self.cfg.cached_activations_path) / f"ctx_{self.context_size}"
+        compressed_path = base_path / f"activations_ctx_{self.context_size}_split_{self.split}.bin"
 
-        # Load
-        tensors = load_file(activations_path)
-        self.cached_act_in = tensors["act_in"].to(self.dtype).cpu() # was saved on gpu
-        self.cached_act_out = tensors["act_out"].to(self.dtype).cpu()
-        self.cached_tokens = tensors["tokens"].cpu()
-
-        logger.info(f"[ActivationsStore] Loaded split {self.split} "
-                    f"with {self.cached_act_in.shape[0]} samples "
-                    f"from {activations_path}")
+        if compressed_path.exists():
+            # Load compressed
+            from clt.training.compressed_activations_store import (
+                CompressionConfig,
+                CompressedActivationsStore,
+            )
             
+            compression_config = CompressionConfig(quantization="int8", compression="zstd")
+            compression_store = CompressedActivationsStore(compression_config)
+            
+            loaded_in, loaded_out, loaded_tokens, metadata = compression_store.load_compressed(compressed_path)
+            
+            self.cached_act_in = loaded_in.to(self.dtype).cpu()
+            self.cached_act_out = loaded_out.to(self.dtype).cpu()
+            self.cached_tokens = loaded_tokens.cpu()
+            
+            logger.info(f"[ActivationsStore] Loaded compressed split {self.split} "
+                        f"with {self.cached_act_in.shape[0]} samples from {compressed_path}")
+        else:
+        
+            activations_path = activation_split_path(self.cfg.cached_activations_path, self.context_size, self.split)
+        
+            # If it doesn't exist, restart from 0
+            if not os.path.exists(activations_path):
+                logger.info(f"[ActivationsStore] No split at {activations_path}, restarting from split {self.rank}")
+                self.split = self.rank
+                activations_path = activation_split_path(self.cfg.cached_activations_path, self.context_size, self.split)
+                if not os.path.exists(activations_path):
+                    raise FileNotFoundError(f"No cached activations found at {activations_path}")
+    
+            # Load uncompressed
+            tensors = load_file(activations_path)
+            self.cached_act_in = tensors["act_in"].to(self.dtype).cpu()
+            self.cached_act_out = tensors["act_out"].to(self.dtype).cpu()
+            self.cached_tokens = tensors["tokens"].cpu()
+    
+            logger.info(f"[ActivationsStore] Loaded uncompressed split {self.split} "
+                        f"with {self.cached_act_in.shape[0]} samples from {activations_path}")
+                
         if not self.cfg.is_sharded: 
             self.split += self.world_size
         else: 
