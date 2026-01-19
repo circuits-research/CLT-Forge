@@ -20,6 +20,10 @@ from clt.utils import DummyModel, activation_split_path
 from clt import logger
 from clt.utils import DTYPE_MAP
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from clt.training.compressed_activations_store import CompressionConfig #importing from compressed_activation_store
+
 class ActivationsStore:
     """
     * Streams activations by: 
