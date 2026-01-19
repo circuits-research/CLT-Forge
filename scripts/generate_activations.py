@@ -9,6 +9,7 @@ from clt.config.clt_training_runner_config import CLTTrainingRunnerConfig
 from clt.transformer_lens.multilingual_patching import patch_official_model_names, patch_convert_hf_model_config
 from clt.training.activations_store import ActivationsStore
 from clt.load_model import load_model
+from clt.training.compressed_activations_store import CompressionConfig
 
 
 total_training_steps = 1000
@@ -82,6 +83,11 @@ model = load_model(
     model_from_pretrained_kwargs=cfg.model_from_pretrained_kwargs,
 )
 
+compression_config = CompressionConfig(
+    quantization="int8",
+    compression="zstd", 
+    compression_level=3,
+)
 activations_store = ActivationsStore(
     model,
     cfg
@@ -90,9 +96,11 @@ activations_store = ActivationsStore(
 activations_store.generate_and_save_activations(
     path="../data/activations_gpt2_multilingual_"+MODEL_PERCENTAGE, 
     split_count=TOTAL_SPLITS, 
-    number_of_tokens=150994944,  # 1024^2 x 144
-    split_begin_idx=split_begin_idx,  # Add this
-    split_end_idx=split_end_idx       # Add this
+    number_of_tokens=150994944,
+    split_begin_idx=split_begin_idx,
+    split_end_idx=split_end_idx,
+    use_compression=True,           
+    compression_config=compression_config, 
 )
 
 print("Finished activations generation and saving.")
