@@ -413,7 +413,6 @@ class CLT(nn.Module):
 
         clt.to(torch.device(device))
         return clt
-
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
         self.W_dec.data /= torch.norm(self.W_dec.data, dim=2, keepdim=True)
