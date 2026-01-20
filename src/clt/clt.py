@@ -15,6 +15,7 @@ from clt.training.optim import JumpReLU
 from clt import logger
 from clt.load_model import load_model
 import torch.distributed as dist
+# import torch.distributed.nn.functional as dist_f
 
 C_l0_COEF = 4
 
@@ -52,7 +53,8 @@ class CLT(nn.Module):
         self.N_layers = cfg.n_layers
         self.d_in = cfg.d_in
         self.d_latent = cfg.d_latent
-        self.local_d_latent = self.d_latent // world_size
+        self.local_d_latent = self.d_latent // world_size if cfg.is_sharded else self.d_latent
+            
         self.dtype = DTYPE_MAP[cfg.dtype]
         self.device = torch.device(cfg.device)
 
@@ -222,9 +224,10 @@ class CLT(nn.Module):
                 out = out.index_add(1, self.k_idx, contrib)
 
                 if self.cfg.is_sharded:
+                    out = out.contiguous()
                     dist.all_reduce(out, op=dist.ReduceOp.SUM)
                 
-                # ALL ranks add replicated bias locally
+                # Add bias after aggregation (not inside sharded block)
                 b_contrib = torch.zeros(1, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
                 b_contrib = b_contrib.index_add(1, self.k_idx, self.b_dec.to(out.dtype).unsqueeze(0))
                 out = out + b_contrib
@@ -233,9 +236,10 @@ class CLT(nn.Module):
                 out = torch.einsum("bnk,nkd->bnd", z, self.W_dec)  # [B, N_layers, d_in]
                 
                 if self.cfg.is_sharded:
+                    out = out.contiguous()
                     dist.all_reduce(out, op=dist.ReduceOp.SUM)
                 
-                # ALL ranks add replicated bias locally
+                # Add bias after aggregation (not inside sharded block)
                 out = out + self.b_dec.to(out.dtype).unsqueeze(0)
 
         else:
@@ -294,29 +298,31 @@ class CLT(nn.Module):
         mse_loss_tensor = torch.nn.functional.mse_loss(act_out, act_pred, reduction="none")
         mse_loss_accross_layers = mse_loss_tensor.sum(dim=-1).mean(dim=0)
         mse_loss = mse_loss_accross_layers.sum()
-
-        ### L0 regularization
+        
         if self.cfg.cross_layer_decoders:
             squared_norms = (self.W_dec**2).sum(dim=2)
-            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask, squared_norms))
+            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask, squared_norms))**2
         else: 
-            feature_norms_local = self.W_dec.norm(dim=2)
+            feature_norms_local = self.W_dec.norm(dim=2)**2
         
         logger.info(f"Rank {self.rank}: feat_act shape = {feat_act.shape}")
         logger.info(f"Rank {self.rank}: feature_norms_local shape = {feature_norms_local.shape}")
         logger.info(f"Rank {self.rank}: W_dec shape = {self.W_dec.shape}")
         logger.info(f"Rank {self.rank}: W_dec requires_grad = {self.W_dec.requires_grad}")
         logger.info(f"Rank {self.rank}: feature_norms_local requires_grad = {feature_norms_local.requires_grad}")
-        
+
         # Compute L0 loss local
         weighted_activations = feat_act * feature_norms_local
         tanh_weighted_activations = torch.tanh(C_l0_COEF * weighted_activations)
         l0_loss_accross_layers = l0_coef * tanh_weighted_activations.sum(dim=-1).mean(dim=0)
         l0_loss_local = l0_loss_accross_layers.sum()
         
-        # SUM losses across ranks
+        # SUM losses across ranks using autograd-aware all_reduce
         if self.cfg.is_sharded:
             dist.all_reduce(l0_loss_local, op=dist.ReduceOp.SUM)
+            # l0_loss_local /= self.world_size
+            dist.all_reduce(l0_loss_accross_layers, op=dist.ReduceOp.SUM)
+            # l0_loss_accross_layers /= self.world_size
         
         l0_loss = l0_loss_local
         logger.info(f"Rank {self.rank}: W_dec.requires_grad={self.W_dec.requires_grad}, has grad={self.W_dec.grad is not None}")
@@ -327,9 +333,10 @@ class CLT(nn.Module):
         dead_feature_loss = df_coef * torch.relu(torch.exp(self.log_threshold) - hidden_pre) * feature_norms_local
         dead_feature_loss = dead_feature_loss.sum(dim=-1).mean(dim=0).sum()
 
-        # SUM losses across ranks
+        # SUM losses across ranks using autograd-aware all_reduce
         if self.cfg.is_sharded:
             dist.all_reduce(dead_feature_loss, op=dist.ReduceOp.SUM)
+            # dead_feature_loss /= self.world_size
 
         ### Dead feature count local
         with torch.no_grad():

@@ -64,7 +64,6 @@ def main():
     # Get absolute path to data directory
 
     cfg = CLTTrainingRunnerConfig(
-        # device=f"cuda:{local_rank}",
         device="cuda", 
         dtype="float32",
         seed=42,
