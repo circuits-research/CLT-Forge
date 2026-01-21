@@ -6,15 +6,15 @@ from typing import Dict, Any, Optional
 T = TypeVar("T", bound=BaseModel)
 
 
-class CLTConfig(BaseModel): 
+class CLTConfig(BaseModel):
     # -----MISC------------------------------
-    device : str 
+    device : str
     dtype: str
-    seed: int 
+    seed: int
     model_name: str
 
     # -----CLT parameters---------------------
-    d_in: int 
+    d_in: int
     d_latent: int
     n_layers: int
     jumprelu_bandwidth: float
@@ -24,6 +24,14 @@ class CLTConfig(BaseModel):
     cross_layer_decoders: bool
     context_size: int
     functional_loss: Optional[str] = None
+
+    # -----Efficient Decoder Parameterization-----
+    # decoder_type: "full" (default), "lora", or "linear_transform"
+    # - "full": separate decoder for each (source_layer, target_layer) pair
+    # - "lora": base decoder + low-rank updates for cross-layer terms
+    # - "linear_transform": base decoder + learned transformations for cross-layer
+    decoder_type: str = "full"
+    decoder_rank: int = 64  # rank for LoRA-style low-rank updates
 
     # -----Sparsity---------------------------
     l0_coefficient: float

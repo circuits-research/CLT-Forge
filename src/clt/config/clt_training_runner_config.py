@@ -35,6 +35,11 @@ class CLTTrainingRunnerConfig(BaseModel):
     jumprelu_init_threshold: float = 0.001
     jumprelu_bandwidth: float = 0.001
     normalize_decoder: bool = False
+
+    # -----Efficient Decoder Parameterization-----
+    # decoder_type: "full" (default), "lora", or "linear_transform"
+    decoder_type: str = "full"
+    decoder_rank: int = 64  # rank for LoRA-style low-rank updates
     
     # -----ActivationStore Parameters---------
     context_size: int = 128
@@ -122,11 +127,20 @@ class CLTTrainingRunnerConfig(BaseModel):
     @field_validator("functional_loss", mode="before")
     def validate_functional_loss(cls, v: Optional[str]) -> Optional[str]:
         valid_losses = ["argmax", "kl"]
-        if v is None: 
+        if v is None:
             return None
         if v not in valid_losses:
             raise ValueError(
                 f"Invalid functional_loss '{v}'. Must be one of {valid_losses}."
+            )
+        return v
+
+    @field_validator("decoder_type", mode="before")
+    def validate_decoder_type(cls, v: str) -> str:
+        valid_types = ["full", "lora", "linear_transform"]
+        if v not in valid_types:
+            raise ValueError(
+                f"Invalid decoder_type '{v}'. Must be one of {valid_types}."
             )
         return v
     
