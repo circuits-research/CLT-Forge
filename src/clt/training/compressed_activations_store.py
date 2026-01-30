@@ -198,14 +198,22 @@ class CompressedActivationsStore:
         else:
             raise ValueError(f"Unknown quantization: {self.config.quantization}")
         
-        return QuantizedTensor(
+        qt = QuantizedTensor(
             data=q_data,
             scale=scale,
             zero_point=zero_point if not self.config.symmetric else None,
             original_shape=original_shape,
             original_dtype=original_dtype,
-            scale_shape=scale.shape,  # CRITICAL FIX: Store scale shape!
+            scale_shape=scale.shape,
         )
+        
+        # FIX: Set quantization type flags
+        if self.config.quantization == "int4":
+            qt._is_int4 = True
+        elif self.config.quantization == "int2":
+            qt._is_int2 = True
+        
+        return qt
     
     def _compute_scale(
         self,
