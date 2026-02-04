@@ -69,10 +69,10 @@ class QuantizedTensor:
         """Convert back to floating point."""
         # Convert to float
         if self.data.dtype == np.uint8:
-            # Handle int4 stored in uint8
             if hasattr(self, '_is_int4') and self._is_int4:
-                # Unpack int4 from uint8
                 data_float = self._unpack_int4(self.data).astype(np.float32)
+            elif hasattr(self, '_is_int2') and self._is_int2:
+                data_float = self._unpack_int2(self.data).astype(np.float32)
             else:
                 data_float = self.data.astype(np.float32)
         else:
@@ -103,16 +103,40 @@ class QuantizedTensor:
         # Each uint8 contains two int4 values
         low = (packed & 0x0F).astype(np.int8)
         high = ((packed >> 4) & 0x0F).astype(np.int8)
-        
-        # Convert 4-bit unsigned to signed (-8 to 7)
-        low = np.where(low > 7, low - 16, low)
-        high = np.where(high > 7, high - 16, high)
-        
+
+        # Reverse the +8 offset applied during packing
+        low = low - 8
+        high = high - 8
+
         # Interleave
         result = np.empty(packed.size * 2, dtype=np.int8)
         result[0::2] = low
         result[1::2] = high
-        return result[:self.original_shape[0] * self.original_shape[1] * self.original_shape[2]]
+        total = 1
+        for s in self.original_shape:
+            total *= s
+        return result[:total]
+
+    def _unpack_int2(self, packed: np.ndarray) -> np.ndarray:
+        """Unpack int2 values stored in uint8."""
+        # Each uint8 contains four int2 values
+        v0 = ((packed >> 6) & 0x03).astype(np.int8)
+        v1 = ((packed >> 4) & 0x03).astype(np.int8)
+        v2 = ((packed >> 2) & 0x03).astype(np.int8)
+        v3 = (packed & 0x03).astype(np.int8)
+
+        # Reverse the +2 offset applied during packing
+        v0 -= 2; v1 -= 2; v2 -= 2; v3 -= 2
+
+        result = np.empty(packed.size * 4, dtype=np.int8)
+        result[0::4] = v0
+        result[1::4] = v1
+        result[2::4] = v2
+        result[3::4] = v3
+        total = 1
+        for s in self.original_shape:
+            total *= s
+        return result[:total]
 
 
 class CompressedActivationsStore:
@@ -296,15 +320,6 @@ class CompressedActivationsStore:
             
             # Pack: low nibble = even indices, high nibble = odd indices
             packed = (flat_unsigned[1::2] << 4) | flat_unsigned[0::2]
-            
-            # Mark as int4 for unpacking
-            qt = QuantizedTensor(
-                data=packed,
-                scale=scale,
-                zero_point=None,
-                original_shape=data.shape,
-            )
-            qt._is_int4 = True
             return packed, None
         else:
             # Asymmetric int4
@@ -319,14 +334,6 @@ class CompressedActivationsStore:
                 flat = np.concatenate([flat, np.array([0], dtype=np.uint8)])
             
             packed = (flat[1::2] << 4) | flat[0::2]
-            
-            qt = QuantizedTensor(
-                data=packed,
-                scale=scale,
-                zero_point=zero_point,
-                original_shape=data.shape,
-            )
-            qt._is_int4 = True
             return packed, zero_point
     
     def _quantize_to_int2(
@@ -355,14 +362,6 @@ class CompressedActivationsStore:
                 (flat_unsigned[2::4] << 2) |
                 flat_unsigned[3::4]
             )
-            
-            qt = QuantizedTensor(
-                data=packed,
-                scale=scale,
-                zero_point=None,
-                original_shape=data.shape,
-            )
-            qt._is_int2 = True
             return packed, None
         else:
             # Asymmetric not implemented for int2 (rarely needed)
@@ -517,16 +516,26 @@ class CompressedActivationsStore:
             
             # Read compressed data
             num_items = struct.unpack("I", f.read(4))[0]
-            
+
+            # Use the file's own metadata to pick the right decompressor,
+            # so loading works regardless of the config this instance was
+            # constructed with.
+            file_compression = metadata.get("compression", "none")
+            if file_compression == "zstd":
+                _decompress = zstd.ZstdDecompressor().decompress
+            elif file_compression == "lz4":
+                import lz4.frame
+                _decompress = lz4.frame.decompress
+            else:
+                _decompress = lambda d: d
+
             data_dict = {}
             for _ in range(num_items):
                 key_size = struct.unpack("I", f.read(4))[0]
                 key = f.read(key_size).decode("utf-8")
                 data_size = struct.unpack("Q", f.read(8))[0]
                 compressed_data = f.read(data_size)
-                
-                # Decompress
-                data_dict[key] = self.decompress_bytes(compressed_data)
+                data_dict[key] = _decompress(compressed_data)
         
         # Reconstruct quantized tensors
         original_shape_in = tuple(metadata["original_shape_in"])
