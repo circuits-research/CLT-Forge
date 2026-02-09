@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "clt"
+version = "0.1.0"
+description = "Training cross-layer-transcoder"
+authors = ["Florent Draye"]
+readme = "README.md"
+packages = [
+    { include = "clt", from = "src" }
+]
+
+[tool.poetry.dependencies]
+python = "3.11"
+sae-lens = ">=5.9.1,<6.11.2"
+pydantic = ">=2.11.3,<3.0.0"
+pytest = ">=8.3.5,<9.0.0"
+wandb = ">=0.19.10,<0.20.0"
+torchvision = ">=0.22.0,<0.23.0"
+matplotlib = ">=3.10.6,<4.0.0"
+argparse = "^1.4.0"
+
+[tool.poetry.group.dev.dependencies]
+pre-commit = "^4.2.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from jaxtyping import Float
 from pathlib import Path
 from safetensors.torch import save_file, load_file
@@ -13,9 +14,6 @@ from clt.config import CLTConfig
 from clt.utils import DTYPE_MAP, CLT_WEIGHTS_FILENAME, CLT_CFG_FILENAME
 from clt.training.optim import JumpReLU
 from clt import logger
-from clt.load_model import load_model
-import torch.distributed as dist
-# import torch.distributed.nn.functional as dist_f
 
 C_l0_COEF = 4
 
@@ -177,7 +175,7 @@ class CLT(nn.Module):
     ]:
         """
         x: [B, N_layers, d_in] if layer is None, else [B, d_in]
-        output: tuple([B, N_layers, d_latent], [B, N_layers, d_latent]) if layer is None, else [B, d_latent]
+        output: tuple([B, N_layers, local_d_latent], [B, N_layers, local_d_latent]) if layer is None, else [B, local_d_latent]
         """
 
         if layer is None: 
@@ -202,10 +200,9 @@ class CLT(nn.Module):
         layer: Optional[int] = None
     ) -> Float[torch.Tensor, "..."]:
         """
-        Decode latent features z back to model activations.
-        Handles both cross-layer decoders and single-layer decoders.
-        Correctly aggregates bias and supports distributed training.
-        
+        z: [B, N_layers, local_d_latent] if layer is None, else [B, local_d_latent]
+        output: [B, N_layers, d_in] if layer is None, else [B, N_layers_out, d_in]
+
         CRITICAL: In feature sharding, after all_reduce(SUM):
         - ALL ranks have identical 'out' tensor
         - b_dec is replicated (same on all ranks)
@@ -223,7 +220,7 @@ class CLT(nn.Module):
                 out = torch.zeros(B, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
                 out = out.index_add(1, self.k_idx, contrib)
 
-                if self.cfg.is_sharded:
+                if self.cfg.is_sharded: # ideally only used for training
                     out = out.contiguous()
                     dist.all_reduce(out, op=dist.ReduceOp.SUM)
                 
@@ -301,34 +298,26 @@ class CLT(nn.Module):
         
         if self.cfg.cross_layer_decoders:
             squared_norms = (self.W_dec**2).sum(dim=2)
-            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask, squared_norms))**2
+            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask, squared_norms)) 
         else: 
-            feature_norms_local = self.W_dec.norm(dim=2)**2
+            feature_norms_local = self.W_dec.norm(dim=2)
         
-        logger.info(f"Rank {self.rank}: feat_act shape = {feat_act.shape}")
-        logger.info(f"Rank {self.rank}: feature_norms_local shape = {feature_norms_local.shape}")
-        logger.info(f"Rank {self.rank}: W_dec shape = {self.W_dec.shape}")
-        logger.info(f"Rank {self.rank}: W_dec requires_grad = {self.W_dec.requires_grad}")
-        logger.info(f"Rank {self.rank}: feature_norms_local requires_grad = {feature_norms_local.requires_grad}")
-
         # Compute L0 loss local
         weighted_activations = feat_act * feature_norms_local
         tanh_weighted_activations = torch.tanh(C_l0_COEF * weighted_activations)
         l0_loss_accross_layers = l0_coef * tanh_weighted_activations.sum(dim=-1).mean(dim=0)
-        l0_loss_local = l0_loss_accross_layers.sum()
+        l0_loss = l0_loss_accross_layers.sum()
         
         # SUM losses across ranks using autograd-aware all_reduce
         if self.cfg.is_sharded:
-            dist.all_reduce(l0_loss_local, op=dist.ReduceOp.SUM)
-            # l0_loss_local /= self.world_size
+            dist.all_reduce(l0_loss, op=dist.ReduceOp.SUM)
+            # l0_loss /= self.world_size
             dist.all_reduce(l0_loss_accross_layers, op=dist.ReduceOp.SUM)
             # l0_loss_accross_layers /= self.world_size
-        
-        l0_loss = l0_loss_local
-        logger.info(f"Rank {self.rank}: W_dec.requires_grad={self.W_dec.requires_grad}, has grad={self.W_dec.grad is not None}")
-        logger.info(f"Rank {self.rank}: L0 loss = {l0_loss.item():.6f}")
-        logger.info(f"Rank {self.rank}: feature_norms has grad = {hasattr(feature_norms_local, 'grad') and feature_norms_local.grad is not None}")
-        
+
+        if self.cfg.debug: 
+            self.log_loss_debug(feat_act, feature_norms_local, l0_loss)
+                
         ### Dead feature penalty 
         dead_feature_loss = df_coef * torch.relu(torch.exp(self.log_threshold) - hidden_pre) * feature_norms_local
         dead_feature_loss = dead_feature_loss.sum(dim=-1).mean(dim=0).sum()
@@ -355,6 +344,22 @@ class CLT(nn.Module):
             dead_feature_loss=dead_feature_loss,
             mse_loss_accross_layers=mse_loss_accross_layers,
             l0_loss_accross_layers=l0_loss_accross_layers
+        )
+
+    def log_loss_debug(
+        feat_act,
+        feature_norms_local,
+        l0_loss,
+    ):
+        logger.info(
+            f"Rank {self.rank} | "
+            f"feat_act shape={tuple(feat_act.shape)} | "
+            f"feature_norms shape={tuple(feature_norms_local.shape)} | "
+            f"W_dec shape={tuple(self.W_dec.shape)} | "
+            f"W_dec.requires_grad={self.W_dec.requires_grad} | "
+            f"feature_norms.requires_grad={feature_norms_local.requires_grad} | "
+            f"W_dec has_grad={self.W_dec.grad is not None} | "
+            f"L0 loss={l0_loss.item():.6f}"
         )
         
     @torch.no_grad()

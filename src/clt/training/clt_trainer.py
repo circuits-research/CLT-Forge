@@ -51,20 +51,20 @@ class CLTTrainer():
             )[1:]
 
         self.lr_scheduler = LearningRateScheduler(
-            cfg.lr_warm_up_type,
-            cfg.lr,
-            cfg.total_training_steps,
-            cfg.lr_warm_up_steps,
+            warmup_type = cfg.lr_warm_up_type,
+            base_lr = cfg.lr,
+            total_training_steps = cfg.total_training_steps,
+            warmup_steps = cfg.lr_warm_up_steps,
             lr_decay_steps = cfg.lr_decay_steps,
             final_lr_scale = cfg.final_lr_scale,
             decay_stable = cfg.decay_stable_steps
         )
 
         self.l0_scheduler = LearningRateScheduler(
-            cfg.l0_warm_up_type,
-            cfg.l0_coefficient,
-            cfg.total_training_steps,
-            cfg.l0_warm_up_steps,
+            warmup_type = cfg.l0_warm_up_type,
+            base_lr = cfg.l0_coefficient,
+            total_training_steps = cfg.total_training_steps,
+            warmup_steps = cfg.l0_warm_up_steps,
             lr_waiting_steps = cfg.l0_waiting_steps
         )
 
@@ -170,28 +170,12 @@ class CLTTrainer():
         if self.cfg.from_pretrained_path is None:
             self._initialize_b_enc()
         
-        # Use helper method to access b_enc
-        clt_model = self._get_clt()
-        if self.cfg.fsdp:
-            with FSDP.summon_full_params(self.clt, recurse=False):
-                b_mean = clt_model.b_enc.mean().item()
-                b_sum = clt_model.b_enc.sum().item()
-        else:
-            b_mean = clt_model.b_enc.mean().item()
-            b_sum = clt_model.b_enc.sum().item()
-        
-        if self.is_main_process:
-            logger.info(f"b_enc mean: {b_mean:.4f}, b_enc sum: {b_sum:.4f}")
-        
         while self.n_tokens < self.cfg.total_training_tokens: 
             logger.info(f"{self.n_tokens} / {self.cfg.total_training_tokens} tokens processed.")
             *tokens_part, acts_in, acts_out = (
                 t.to(device=self.cfg.device) 
                 for t in next(self.activations_store.__iter__())
             )
-
-            if self.cfg.check_activations_across_ranks_are_equal and self.cfg.is_sharded: 
-                self.check_activations_across_ranks_are_equal(acts_in)
 
             while self.n_tokens < self.cfg.total_training_tokens:
 
@@ -200,7 +184,7 @@ class CLTTrainer():
                     for t in next(self.activations_store.__iter__())
                 )
 
-                if self.cfg.check_activations_across_ranks_are_equal and self.cfg.is_sharded:
+                if self.cfg.debug and self.cfg.is_sharded:
                     self.check_activations_across_ranks_are_equal()
 
                 loss_metrics = self._compute_training_step_loss(
@@ -416,7 +400,8 @@ class CLTTrainer():
 
             self.optimizer.step()
 
-        self._log_debug_info(loss_metrics)
+        if self.cfg.debug: 
+            self._log_debug_info(loss_metrics)
 
         self.update_optimizer_lr()
         self.l0_scheduler.step()
@@ -446,11 +431,8 @@ class CLTTrainer():
         act_pred = loss_metrics.act_pred
         loss = loss_metrics.mse_loss + loss_metrics.l0_loss # TODO, need to change this
 
-        if self.cfg.is_distributed:
-            dead_features_per_layer = self.clt.module.get_dead_features().sum(dim=1)
-        else:
-            dead_features_per_layer = self.clt.get_dead_features().sum(dim=1)
-
+        clt_model = self._get_clt()
+        dead_features_per_layer = clt_model.get_dead_features().sum(dim=1)
         dead_features_average_count = dead_features_per_layer.float().mean()
 
         # metrics for currents acts
@@ -597,3 +579,10 @@ class CLTTrainer():
     #     self.activations_store.mix_with_previous_buffer = False
     #     self.activations_store.split = self.activations_store.rank
     #     self.activations_s
+
+    def _get_clt(self) -> CLT:
+        """Get the unwrapped CLT model."""
+        if self.cfg.is_distributed:
+            return self.clt.module
+        else:
+            return self.clt

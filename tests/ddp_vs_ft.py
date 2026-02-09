@@ -13,7 +13,6 @@ import torch.distributed as dist
 from clt.config.clt_config import CLTConfig
 from clt.clt import CLT
 
-
 seed = 42
 
 def set_seed(seed, rank):
@@ -26,26 +25,18 @@ def set_seed(seed, rank):
         rank: process rank (for DDP). Use rank-aware seeds if desired.
     """
 
-    # ----- Python & NumPy -----
     random.seed(seed + rank)
     np.random.seed(seed + rank)
-
-    # ----- PyTorch -----
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
     torch.cuda.manual_seed_all(seed + rank)
-
-    # ----- cuDNN / CUDA -----
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
 
-    # ----- Python hash seed (important for dict/set order) -----
     os.environ["PYTHONHASHSEED"] = str(seed + rank)
-
     # Optional: make matmul deterministic (Ampere+)
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
 
 def test_ddp_vs_feature_sharding():
     
@@ -55,7 +46,7 @@ def test_ddp_vs_feature_sharding():
     feature sharding shards the dim across ranks, while DDP keeps full params on each rank.
     feature sharding processes the same data on each rank, while DDP splits the data into mini-batches across ranks.
     """
-    
+    os.environ["MASTER_PORT"] = "29501"
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -87,7 +78,7 @@ def test_ddp_vs_feature_sharding():
         l0_coefficient=1.15,
         ddp=False,
         feature_sharding=True,
-        functional_loss="kl"
+        debug=False,
     )
     
     clt_fs = CLT(cfg_fs, rank=rank, world_size=world_size)
@@ -150,11 +141,10 @@ def test_ddp_vs_feature_sharding():
         l0_coefficient=1.15,
         ddp=True,
         feature_sharding=False,
-        functional_loss="kl"
+        debug=False,
     )
     
     clt = CLT(cfg_ddp, rank=rank, world_size=world_size)
-    clt.eval()
     
     clt_ddp = torch.nn.parallel.DistributedDataParallel(
             clt,
@@ -224,7 +214,7 @@ def test_ddp_vs_feature_sharding():
         print(f"Rank 0 L0 loss: {metrics_fs.l0_loss.item():.6f}")
         print(f"Rank 0 DF loss: {metrics_fs.dead_feature_loss.item():.6f}\n")
         
-        print("Forward Comparison")
+        print("Forward Comparison (should be FALSE)")
         print(f"MSE. ddp: {metrics_ddp.mse_loss.item():.6f}, fs: {metrics_fs.mse_loss.item():.6f}, match: {torch.allclose(metrics_ddp.mse_loss, metrics_fs.mse_loss, atol=1e-4)}")
         print(f"L0. ddp: {metrics_ddp.l0_loss.item():.6f},  fs: {metrics_fs.l0_loss.item():.6f}, match: {torch.allclose(metrics_ddp.l0_loss, metrics_fs.l0_loss, atol=1e-4)}")
         print(f"DF. ddp: {metrics_ddp.dead_feature_loss.item():.6f},  fs: {metrics_fs.dead_feature_loss.item():.6f}, match: {torch.allclose(metrics_ddp.dead_feature_loss, metrics_fs.dead_feature_loss, atol=1e-4)}\n")
@@ -342,6 +332,8 @@ def test_ddp_vs_feature_sharding():
         enc_param_match = torch.allclose(clt_ddp.module.W_enc, W_enc_full_after, atol=1e-3)
         print(f"W_enc parameter match after update: {enc_param_match}")
         print('Test completed.\n')
+
+    assert False
         
     dist.destroy_process_group()
 

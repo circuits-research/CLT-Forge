@@ -1,8 +1,8 @@
 import pytest
 import torch
-from featflow.training.activations_store import ActivationsStore
-from featflow.config import CLTTrainingRunnerConfig
-from featflow.load_model import load_model
+from clt.training.activations_store import ActivationsStore
+from clt.config import CLTTrainingRunnerConfig
+from sae_lens.load_model import load_model
 from transformer_lens.hook_points import HookedRootModule
 from tests.utils import build_clt_training_runner_cfg
 from pathlib import Path
@@ -17,6 +17,7 @@ project_root = current_file.parent.parent
         {
             "model_name": "gpt2-small",
             "dataset_path": str(project_root / "data/NeelNanda_c4_10k_tokenized"),
+            "disk": True,
             "d_in": 768,
         }
     ]
@@ -99,7 +100,7 @@ def test_rebuild_buffers_preserves_shapes(cfg, model):
     assert store._storage_in.ndim == 3  # shape: [N, L, d]
 
 def test_norm_scaling_factor_application(cfg, model):
-    cfg.train_batch_size_tokens = 1000
+    cfg.train_batch_size_tokens = 32 * 32
     cfg.context_size = 32
     cfg.store_batch_size_prompts = 32
     cfg.n_batches_in_buffer = 32 # 32*32*32 tokens in buffer 

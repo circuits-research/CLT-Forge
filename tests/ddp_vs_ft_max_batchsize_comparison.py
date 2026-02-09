@@ -98,7 +98,6 @@ def test_batch_size(args, model, batch_size, device, mode="ddp"):
                 del locals()[var]
         cleanup_memory()
 
-
 def binary_search_max_batch_size(args, model, device, mode="ddp", min_batch=1, max_batch=2048):
     """
     Binary search to find maximum batch size that fits in memory.
@@ -185,9 +184,9 @@ def test_max_batch_size_comparison(args):
         cross_layer_decoders=args.cross_layer_decoders,
         context_size=args.context_size,
         l0_coefficient=args.l0_coefficient,
+        debug=False,
         ddp=False,
         feature_sharding=True,
-        functional_loss=args.functional_loss
     )
     
     clt_fs = CLT(cfg_fs, rank=rank, world_size=world_size) # here, whether parameters are synced is not relevant
@@ -233,9 +232,9 @@ def test_max_batch_size_comparison(args):
         cross_layer_decoders=args.cross_layer_decoders,
         context_size=args.context_size,
         l0_coefficient=args.l0_coefficient,
+        debug=False,
         ddp=True,
         feature_sharding=False,
-        functional_loss=args.functional_loss
     )
     
     clt_ddp = CLT(cfg_ddp, rank=rank, world_size=world_size)
@@ -322,7 +321,6 @@ if __name__ == "__main__":
     parser.add_argument("--cross_layer_decoders", action="store_true", help="Use cross layer decoders")
     parser.add_argument("--l0_coefficient", type=float, default=1.15, help="L0 coefficient")
     parser.add_argument("--df_coefficient", type=float, default=1e-4, help="Dead feature coefficient")
-    parser.add_argument("--functional_loss", type=str, default="kl", help="Functional loss type")
     args = parser.parse_args()
     
     test_max_batch_size_comparison(args)

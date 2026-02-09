@@ -2,11 +2,11 @@ import torch
 import pytest
 from torch.autograd import gradcheck
 
-from featflow.training.optim import LearningRateScheduler, rectangle, Step, JumpReLU  # Replace with your actual module name
+from clt.training.optim import LearningRateScheduler, rectangle, Step, JumpReLU  # Replace with your actual module name
 
 def test_learning_rate_scheduler_behavior():
     scheduler = LearningRateScheduler(
-        base_lr=1.0, total_training_steps=10, warmup_steps=3, lr_decay_steps=3, final_lr_scale=0.1, lr_waiting_steps=0
+        warmup_type = "cosine", base_lr=1.0, total_training_steps=10, warmup_steps=3, lr_decay_steps=3, final_lr_scale=0.1, lr_waiting_steps=0
     )
     lrs = [0] + [scheduler.step() for _ in range(12)]
 
@@ -32,7 +32,6 @@ def test_custom_autograd_functions_gradcheck(func_class):
     threshold = torch.tensor([0.5, 0.5], dtype=torch.float64, requires_grad=True)
     bandwidth = 0.1
     assert gradcheck(func_class.apply, (x, threshold, bandwidth), eps=1e-6, atol=1e-4)
-
 
 def test_step_forward_values():
     x = torch.tensor([[0.3, 0.7]])

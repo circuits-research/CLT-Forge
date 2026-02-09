@@ -1,7 +1,7 @@
 import pytest 
 from tests.utils import build_clt_training_runner_cfg
-from featflow.config import CLTTrainingRunnerConfig, CLTConfig
-from featflow.clt import CLT
+from clt.config import CLTTrainingRunnerConfig, CLTConfig
+from clt.clt import CLT
 from pathlib import Path
 import os 
 import torch 
@@ -9,22 +9,22 @@ from pydantic import ValidationError
 
 C_l0_COEF = 4
 
-# Get the directory of the current file
 current_file = Path(__file__).resolve()
 project_root = current_file.parent
 
-# Define a new fixture for different configurations
 @pytest.fixture(
     params=[
         {
             "model_name": "tiny-stories-1M",
             "dataset_path": str(project_root / "data/NeelNanda_c4_10k_tokenized"),
             "cross_layer_decoders": True,
+            "disk": True
         }, 
         {
             "model_name": "tiny-stories-1M",
             "dataset_path": str(project_root / "data/NeelNanda_c4_10k_tokenized"),
             "cross_layer_decoders": False,
+            "disk": True
         }
     ]
 )
@@ -75,6 +75,7 @@ def test_encode(clt: CLT):
 
 def test_forward(clt: CLT): 
     acts_in = torch.randn(10, clt.cfg.n_layers, clt.cfg.d_in, device = clt.cfg.device)
+
     z, _ = clt.encode(acts_in)
     acts_pred = clt.decode(z)
     acts_out = clt.forward_eval(acts_in)
@@ -115,8 +116,8 @@ def test_loss(clt: CLT):
 
     if clt.cfg.cross_layer_decoders:
         for layer in range(clt.N_layers):         
-            thr   = torch.exp(clt.log_threshold[layer])
-            feature_hidden[:, layer, :]   = acts_in[:, layer, :] @ clt.W_enc[layer] + clt.b_enc[layer]
+            thr = torch.exp(clt.log_threshold[layer])
+            feature_hidden[:, layer, :] = acts_in[:, layer, :] @ clt.W_enc[layer] + clt.b_enc[layer]
             feature_acts[:, layer, :] = feature_hidden[:, layer, :] * (feature_hidden[:, layer, :] > thr)
 
             for k in range(layer, clt.N_layers):

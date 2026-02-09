@@ -64,6 +64,7 @@ def test_ddp_vs_feature_sharding(args):
         l0_coefficient=args.l0_coefficient,
         ddp=False,
         feature_sharding=True,
+        debug=False,
         functional_loss=args.functional_loss
     )
     
@@ -127,6 +128,7 @@ def test_ddp_vs_feature_sharding(args):
         l0_coefficient=args.l0_coefficient,
         ddp=True,
         feature_sharding=False,
+        debug=False,
         functional_loss=args.functional_loss
     )
     

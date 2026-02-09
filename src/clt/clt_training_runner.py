@@ -8,13 +8,14 @@ import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+
 from transformers import AutoConfig
+from sae_lens.load_model import load_model
 
 from clt.transformer_lens.multilingual_patching import patch_official_model_names, patch_convert_hf_model_config
 from clt.config import CLTTrainingRunnerConfig, CLTConfig
 from clt.utils import DTYPE_MAP, DummyModel
 from clt.clt import CLT
-from clt.load_model import load_model
 from clt.training.activations_store import ActivationsStore
 from clt.training.clt_trainer import CLTTrainer
 from clt import logger
@@ -198,11 +199,11 @@ class CLTTrainingRunner:
         def _unwrap_clt(m):
             return m.module if hasattr(m, "module") else m
 
-        clt_obj = _unwrap_clt(trainer.clt)
+        clt = _unwrap_clt(trainer.clt)
 
         if self.cfg.is_sharded:
             # Each rank writes rank{r}_weights.safetensors
-            clt_obj.save_model(str(base_path), save_cfg=(self.rank == 0), rank=self.rank)
+            clt.save_model(str(base_path), save_cfg=(self.rank == 0), rank=self.rank)
 
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
@@ -212,8 +213,6 @@ class CLTTrainingRunner:
 
         if self.rank == 0:
             if self.fsdp:
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 
                 with FSDP.state_dict_type(
                     trainer.clt,
@@ -221,14 +220,14 @@ class CLTTrainingRunner:
                     FullStateDictConfig(offload_to_cpu=True),
                 ):
                     # In this context, trainer.clt.state_dict() is full; your save_model uses self.state_dict()
-                    clt_obj.save_model(str(base_path), save_cfg=True, rank=None)
+                    clt.save_model(str(base_path), save_cfg=True, rank=None)
 
             elif self.ddp:
-                clt_obj.save_model(str(base_path), save_cfg=True, rank=None)
+                clt.save_model(str(base_path), save_cfg=True, rank=None)
 
             else:
                 # single GPU
-                clt_obj.save_model(str(base_path), save_cfg=True, rank=None)
+                clt.save_model(str(base_path), save_cfg=True, rank=None)
 
         if dist.is_available() and dist.is_initialized():
             dist.barrier()

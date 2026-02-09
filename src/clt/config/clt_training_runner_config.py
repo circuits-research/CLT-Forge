@@ -11,11 +11,12 @@ T = TypeVar("T", bound=BaseModel)
 class CLTTrainingRunnerConfig(BaseModel): 
     # -----MISC------------------------------
     device : str = "cuda"
-    dtype: str = "float32"
+    dtype: str = "float32" # if bfloat16, then scaler is active
     seed: int = 42
     n_checkpoints: int = 4
     checkpoint_path: str = "checkpoints"
     logger_verbose: bool = True 
+    debug: bool = False
 
     # -----Model & Data-----------------------
     model_class_name: str = "HookedTransformer"
@@ -24,28 +25,30 @@ class CLTTrainingRunnerConfig(BaseModel):
     model_from_pretrained_kwargs: Optional[Dict[str, Any]] = None
     dataset_path: str = "" # Hugging face path
     is_dataset_tokenized: bool = True
-    is_multilingual_split_dataset: bool = False
+    is_multilingual_split_dataset: bool = False # can be ignored, it is only for multilingual datasets processing
     monolingual_language: Optional[str] = "eng"
+    disk: bool = False # use load_from_disk instead and local dataset
 
     # -----CLT parameters---------------------
     from_pretrained_path: str | None = None
     d_in: int = 512
     expansion_factor: Optional[int] = None
     d_latent: Optional[int] = None
-    jumprelu_init_threshold: float = 0.001
-    jumprelu_bandwidth: float = 0.001
+    jumprelu_init_threshold: float = 0.03
+    jumprelu_bandwidth: float = 1.
     normalize_decoder: bool = False
     
     # -----ActivationStore Parameters---------
-    context_size: int = 128
-    n_batches_in_buffer: int = 20
+    context_size: int = 32
+    n_batches_in_buffer: int = 20 # buffer_size = n_batches_in_buffer * store_batch_size_prompts * context_size (for on the fly loading)
     store_batch_size_prompts: int = 32
-    cached_activations_path: Optional[str] = None
-    n_train_batch_per_buffer: Optional[int] = None # Folder where activations splits are saved
+    cached_activations_path: Optional[str] = None # defines whether on the fly activations computation or pre-cached activations
+    n_train_batch_per_buffer: Optional[int] = None # buffer_size = n_train_batch_per_buffer * train_batch_size_tokens (for pre-cached activations, alternate definition)
+    n_batches_for_norm_estimate: int = 10
 
     # -----Training/Optimization--------------
     total_training_tokens: int = 100_000_000
-    train_batch_size_tokens: int = 4096
+    train_batch_size_tokens: int = 4096 # should be divisible by the context
     adam_beta1: float = 0.0
     adam_beta2: float = 0.999
     lr: float = 1e-5
@@ -55,8 +58,6 @@ class CLTTrainingRunnerConfig(BaseModel):
     final_lr_scale: float = 0.0
     cross_layer_decoders: bool = True
     lr_warm_up_type: str = "cosine"
-    use_mixed_precision: bool = True
-    check_activations_across_ranks_are_equal: bool = True
 
     # ------Functional Loss------------------
     functional_loss: Optional[str] = None
@@ -66,11 +67,11 @@ class CLTTrainingRunnerConfig(BaseModel):
     fc_waiting_steps: Optional[int] = None
 
     # -----Sparsity---------------------------
-    l0_coefficient: float = 1e-4
-    l0_warm_up_steps: int = 5000
+    l0_coefficient: float = 1e-3
+    l0_warm_up_steps: int = 1000
     l0_waiting_steps: int = 0
     l0_warm_up_type: str = "linear"
-    dead_penalty_coef: float =  0.0 #7.5 * 1e-8
+    dead_penalty_coef: float =  7.5 * 1e-8
     optimal_l0: Optional[float] = None
     checkpoint_l0: Optional[list[int]] = None
 
@@ -101,23 +102,30 @@ class CLTTrainingRunnerConfig(BaseModel):
         }
     )
 
-    @model_validator(mode="after")
-    def validate_ddp_fsdp_sharding(cls, cfg: "CLTTrainingRunnerConfig") -> "CLTTrainingRunnerConfig":
-        if int(cfg.ddp) + int(cfg.fsdp) + int(cfg.feature_sharding) > 1: 
+    @model_validator(mode="before")
+    def validate_ddp_fsdp_sharding(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        ddp = bool(values.get("ddp"))
+        fsdp = bool(values.get("fsdp"))
+        feature_sharding = bool(values.get("feature_sharding"))
+
+        if int(ddp) + int(fsdp) + int(feature_sharding) > 1: 
                 raise ValueError(
                     "Only one can be selected between ddp, sfdp, and feature sharding"
                 )
-        return cfg
+        return values
 
-    @model_validator(mode="after")
-    def validate_ddp_and_device(cls, cfg: "CLTTrainingRunnerConfig") -> "CLTTrainingRunnerConfig":
-        if cfg.ddp:
+    @model_validator(mode="before")
+    def validate_ddp_and_device(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        ddp = bool(values.get("ddp"))
+        device = bool(values.get("device"))
+
+        if ddp:
             # Check if device starts with "cuda" (accepts "cuda", "cuda:0", "cuda:1", etc.)
-            if not torch.cuda.is_available() or not cfg.device.startswith("cuda"):
+            if not torch.cuda.is_available() or not device.startswith("cuda"):
                 raise ValueError(
                     "DDP is enabled but CUDA is not available or not selected."
                 )
-        return cfg
+        return values
     
     @field_validator("functional_loss", mode="before")
     def validate_functional_loss(cls, v: Optional[str]) -> Optional[str]:
@@ -147,12 +155,15 @@ class CLTTrainingRunnerConfig(BaseModel):
     
     @model_validator(mode="before")
     def wandb_id_check(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        if not values.get("log_to_wandb", True):
+            return values
+
         wandb_id = values.get("wandb_id")
         if not wandb_id:
-            raise ValueError("wandb_id must be provided")  # Force explicit
-        
+            raise ValueError("wandb_id must be provided when log_to_wandb=True")
+
         base_path = values.get("checkpoint_path", "checkpoints")
-        values["checkpoint_path"] = f"{base_path}/{wandb_id}"  # Creates checkpoints/my_run_id/
+        values["checkpoint_path"] = f"{base_path}/{wandb_id}"
         return values
     
     @model_validator(mode="before")
@@ -175,6 +186,17 @@ class CLTTrainingRunnerConfig(BaseModel):
             raise ValueError(
                 "If you set cached_activations_path, you must also set n_train_batch_per_buffer."
             )
+        return values
+
+    def check_context_divides_tokens_per_batch(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        context_size = values.get("context_size")
+        train_batch_size_tokens = values.get("train_batch_size_tokens")
+
+        if train_batch_size_tokens % context_size != 0: 
+            raise ValueError(
+                "Ctx size must divide train_batch_size_tokens."
+            )
+        
         return values
             
     @model_validator(mode="before")

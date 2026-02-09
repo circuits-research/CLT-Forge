@@ -12,7 +12,7 @@ class LearningRateScheduler:
         lr_decay_steps: int = 1,
         final_lr_scale: float = 0.0,
         lr_waiting_steps: int = 0, 
-        decay_stable: int = 0
+        decay_stable: int = 0 # plateau at final lr (useful for replacement score finetuning)
     ):
         assert 0 <= final_lr_scale <= 1.0, "final_lr_scale must be between 0 and 1"
         assert warmup_steps >= 0 and lr_decay_steps > 0, "warmup_steps must be ≥ 0, lr_decay_steps > 0"

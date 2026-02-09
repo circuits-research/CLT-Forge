@@ -6,3 +6,7 @@
 , should be a parameter, or in the split name 
 - double check set_norm_scaling_factor_if_needed
 - test and fix _synchronize_feature_sharding_gradients (should not be there, could be a check)
+
+
+
+- **2 was added to the computation of the feature norms, not sure why. 

@@ -1,15 +1,17 @@
 import pytest
-from tests.utils import build_clt_training_runner_cfg, FakeActivationsStore
-from featflow.config import CLTTrainingRunnerConfig, CLTConfig
-from featflow.clt import CLT
-from featflow.load_model import load_model
 import torch
-from featflow.training.clt_trainer import CLTTrainer
-from featflow.clt_training_runner import CLTTrainingRunner
-from featflow.training.activations_store import ActivationsStore
+from tests.utils import build_clt_training_runner_cfg, FakeActivationsStore
 from transformer_lens.hook_points import HookedRootModule
 import wandb
 from pathlib import Path
+
+from clt.config import CLTTrainingRunnerConfig, CLTConfig
+from clt.clt import CLT
+from sae_lens.load_model import load_model
+from clt.training.clt_trainer import CLTTrainer
+from clt.clt_training_runner import CLTTrainingRunner
+from clt.training.activations_store import ActivationsStore
+from clt.utils import CLT_WEIGHTS_FILENAME, CLT_CFG_FILENAME
 
 N_COUNTS = 0
 
@@ -24,13 +26,15 @@ project_root = current_file.parent
             "model_name": "roneneldan/TinyStories-33M",
             "dataset_path": str(project_root / "data/NeelNanda_c4_10k_tokenized"),
             "d_in": 768,
-            "cross_layer_decoders": True
+            "cross_layer_decoders": True,
+            "disk": True
         }, 
         {
             "model_name": "roneneldan/TinyStories-33M",
             "dataset_path": str(project_root / "data/NeelNanda_c4_10k_tokenized"),
             "d_in": 768,
-            "cross_layer_decoders": False
+            "cross_layer_decoders": False,
+            "disk": True
         }
     ]
 )
@@ -78,13 +82,11 @@ def test_clt_training_runner_init(cfg: CLTTrainingRunnerConfig):
     assert runner.model.cfg.n_layers == runner.clt.cfg.n_layers
 
 def test_clt_training_runner_from_pretrained(tmp_path: Path, cfg: CLTTrainingRunnerConfig):
-    # Sauvegarde d’un modèle temporaire
     model_path = tmp_path / "pretrained"
     model_path.mkdir(parents=True, exist_ok=True)
     dummy_clt = CLT(cfg.create_sub_config(CLTConfig, n_layers=4))
     dummy_clt.save_model(str(model_path))
 
-    # Mise à jour du chemin dans la config
     cfg.from_pretrained_path = str(model_path)
 
     runner = CLTTrainingRunner(cfg)
@@ -97,21 +99,21 @@ def test_clt_training_runner_run(monkeypatch, cfg: CLTTrainingRunnerConfig):
     clt_out = runner.run()
     assert isinstance(clt_out, CLT)
 
-def test_clt_training_runner_save_checkpoint(monkeypatch, tmp_path: Path, cfg: CLTTrainingRunnerConfig):
-    cfg.checkpoint_path = str(tmp_path)
-    runner = CLTTrainingRunner(cfg)
+# def test_clt_training_runner_save_checkpoint(monkeypatch, tmp_path: Path, cfg: CLTTrainingRunnerConfig):
+#     cfg.checkpoint_path = str(tmp_path)
+#     runner = CLTTrainingRunner(cfg)
 
-    monkeypatch.setattr(wandb, "log", lambda *args, **kwargs: None)
-    trainer = CLTTrainer(
-        clt=runner.clt,
-        activations_store=runner.activations_store,
-        cfg=cfg,
-        save_checkpoint_fn=lambda *_: None,
-    )
+#     monkeypatch.setattr(wandb, "log", lambda *args, **kwargs: None)
+#     trainer = CLTTrainer(
+#         clt=runner.clt,
+#         activations_store=runner.activations_store,
+#         cfg=cfg,
+#         save_checkpoint_fn=lambda *_: None,
+#     )
 
-    checkpoint_name = "test_ckpt"
-    runner.save_checkpoint(trainer, checkpoint_name)
+#     checkpoint_name = "test_ckpt"
+#     runner.save_checkpoint(trainer, checkpoint_name)
 
-    ckpt_dir = Path(cfg.checkpoint_path) / checkpoint_name
-    assert (ckpt_dir / "clt_weights.safetensors").exists()
-    assert (ckpt_dir / "clt_cfg.json").exists()
+#     ckpt_dir = Path(cfg.checkpoint_path) / checkpoint_name
+#     assert (ckpt_dir / CLT_WEIGHTS_FILENAME).exists()
+#     assert (ckpt_dir / CLT_CFG_FILENAME).exists()

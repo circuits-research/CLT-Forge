@@ -12,6 +12,7 @@ class CLTConfig(BaseModel):
     dtype: str
     seed: int 
     model_name: str
+    debug: bool 
 
     # -----CLT parameters---------------------
     d_in: int 

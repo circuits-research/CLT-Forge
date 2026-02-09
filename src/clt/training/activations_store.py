@@ -80,7 +80,7 @@ class ActivationsStore:
             else:
                 assert cfg.monolingual_language is not None, "monolingual_language must be specified for monolingual datasets"
                 logger.info(f"Loading {cfg.monolingual_language} dataset...")
-                self.raw_ds = load_dataset_auto(cfg.dataset_path, split=cfg.monolingual_language)
+                self.raw_ds = load_dataset_auto(cfg.dataset_path, split=cfg.monolingual_language, disk=self.cfg.disk)
             logger.info(f"Loaded dataset")
         
             if "tokens" not in self.raw_ds.column_names:
@@ -379,7 +379,7 @@ class ActivationsStore:
         if self.estimated_norm_scaling_factor_in is None or self.estimated_norm_scaling_factor_out is None:
             
             # ensures all ranks consume batches (important for feature_sharding to keep same pointer)
-            self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out = self.estimate_norm_scaling_factor()
+            self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out = self.estimate_norm_scaling_factor(self.cfg.n_batches_for_norm_estimate)
             
             if self.cfg.uses_process_group:
                 dist.barrier() 
@@ -583,46 +583,63 @@ class ActivationsStore:
             except StopIteration:
                 self._rebuild_buffers()
 
-# TODO: should be more systematic, the split 
-# helps to load dataset either locally or from huggingface
-def load_dataset_auto(path_or_name: str, split: str = "train", is_multilingual_split_dataset: bool = False):
-    if os.path.exists(path_or_name):
-        logger.info("Loading from disk")
+def load_dataset_auto(
+    path_or_name: str,
+    split: str = "train",
+    is_multilingual_split_dataset: bool = False,
+    disk: bool = False
+): 
+    if is_multilingual_split_dataset:
+        ds_dict = load_dataset(path_or_name)
+        datasets_with_lang = []
+        for split_name, ds in ds_dict.items():
+            ds = ds.add_column("language", [split_name] * len(ds))
+            datasets_with_lang.append(ds)
+        return datasets.concatenate_datasets(datasets_with_lang)
+    
+    if disk:
+        return load_from_disk(path_or_name)
 
-        # return load_from_disk(path_or_name)
+    return load_dataset(path_or_name, split=split)
 
-        return load_dataset(
-            path_or_name,
-            split="train",
-            cache_dir=os.path.expanduser("~/.cache/huggingface/datasets"),
-            keep_in_memory=False
-        )
-    else:
-        # For the multilingual dataset
-        if is_multilingual_split_dataset:
+# def load_dataset_auto(path_or_name: str, split: str = "train", is_multilingual_split_dataset: bool = False):
+#     if os.path.exists(path_or_name):
+#         logger.info("Loading from disk")
 
-            logger.info(f"Loading dataset {path_or_name}...")
-            start_time = time.time()
+#         # return load_from_disk(path_or_name)
+
+#         return load_dataset(
+#             path_or_name,
+#             split="train",
+#             cache_dir=os.path.expanduser("~/.cache/huggingface/datasets"),
+#             keep_in_memory=False
+#         )
+#     else:
+#         # For the multilingual dataset
+#         if is_multilingual_split_dataset:
+
+#             logger.info(f"Loading dataset {path_or_name}...")
+#             start_time = time.time()
             
-            def progress_callback(info):
-                elapsed = time.time() - start_time
-                logger.info(f"Loading... {elapsed:.1f}s elapsed")
+#             def progress_callback(info):
+#                 elapsed = time.time() - start_time
+#                 logger.info(f"Loading... {elapsed:.1f}s elapsed")
             
-            ds_dict = load_dataset(path_or_name)
-            elapsed = time.time() - start_time
-            logger.info(f"Dataset loaded successfully in {elapsed:.1f}s: {list(ds_dict.keys())}")
+#             ds_dict = load_dataset(path_or_name)
+#             elapsed = time.time() - start_time
+#             logger.info(f"Dataset loaded successfully in {elapsed:.1f}s: {list(ds_dict.keys())}")
             
-            # Add language column based on split name before concatenation
-            datasets_with_lang = []
-            for split_name, ds in ds_dict.items():
-                ds = ds.add_column("language", [split_name] * len(ds))
-                datasets_with_lang.append(ds)
+#             # Add language column based on split name before concatenation
+#             datasets_with_lang = []
+#             for split_name, ds in ds_dict.items():
+#                 ds = ds.add_column("language", [split_name] * len(ds))
+#                 datasets_with_lang.append(ds)
             
-            # Concatenate all splits into one Dataset
-            return datasets.concatenate_datasets(datasets_with_lang)
-        else:
-            logger.info("Loading from hub")
-            return load_dataset(path_or_name, split=split)
+#             # Concatenate all splits into one Dataset
+#             return datasets.concatenate_datasets(datasets_with_lang)
+#         else:
+#             logger.info("Loading from hub")
+#             return load_dataset(path_or_name, split=split)
             
 def _filter_buffer_acts(
     buffer: tuple[torch.Tensor, torch.Tensor | None],

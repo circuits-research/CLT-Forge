@@ -11,9 +11,6 @@ checkpoints/
 # poetry
 poetry.lock
 
-# poetry
-pyproject.toml
-
 # logs
 logs/
 **/logs/
@@ -30,8 +27,15 @@ __pycache__/
 save/
 **/save/
 
+# cluster
+**/cluster/
+
 # claude
 CLAUDE.md
 
 # data
 data/
+
+# submission files
+interactive_gpu.sub
+**/interactive_gpu.sub
