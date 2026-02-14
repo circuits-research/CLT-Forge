@@ -13,6 +13,7 @@ from clt.transformer_lens.multilingual_patching import patch_official_model_name
 from clt.config import CLTTrainingRunnerConfig, CLTConfig
 from clt.utils import DTYPE_MAP, DummyModel
 from clt.clt import CLT
+from clt import logger
 from clt.load_model import load_model
 from clt.training.activations_store import ActivationsStore
 from clt.training.clt_trainer import CLTTrainer
@@ -161,7 +162,7 @@ class CLTTrainingRunner:
             logger.info(f"lr: {self.cfg.lr}")
             logger.info(f"dead_penalty_coef: {self.cfg.dead_penalty_coef}")
 
-        trainer = CLTTrainer(
+        self.trainer = CLTTrainer(
             clt=self.clt,
             activations_store=self.activations_store,
             save_checkpoint_fn=self.save_checkpoint,
@@ -170,7 +171,7 @@ class CLTTrainingRunner:
             world_size=self.world_size
         )
 
-        clt = trainer.fit()
+        clt = self.trainer.fit()
 
         if self.cfg.log_to_wandb and self.is_main_process:
             wandb.finish()

@@ -149,6 +149,7 @@ class CLTTrainer():
             if self.cfg.from_pretrained_path is None:
                 self._initialize_b_enc()
                 
+            #print(f"[TRAINER] GPU {self.rank} - b_enc mean: {self.clt.b_enc.mean().item():.4f}, b_enc sum: {self.clt.b_enc.sum().item():.4f}", flush=True)
             logger.info(f"GPU {self.rank} - b_enc mean: {self.clt.b_enc.mean().item():.4f}, b_enc sum: {self.clt.b_enc.sum().item():.4f}")
             
             while self.n_tokens < self.cfg.total_training_tokens: 
@@ -169,13 +170,15 @@ class CLTTrainer():
 
                 self.n_tokens += self.cfg.train_batch_size_tokens
                 
-                if self.accumulation_step == 0:
+                # Only log, checkpoint, and count steps after completing accumulation cycle
+                if self.accumulation_step == 0: 
                     self.n_training_steps += 1
                     
-                if self.is_main_process:
+                    #print(f"[TRAINER] Step {self.n_training_steps} - MSE: {loss_metrics.mse_loss:.4f}, L0: {loss_metrics.l0_loss:.4f}", flush=True)
+                    logger.info(f"Training step {self.n_training_steps}")
                     self._log_train_step(loss_metrics)
                     self._run_and_log_evals()
-                self._checkpoint_if_needed()
+                    self._checkpoint_if_needed()
 
                 # if self.cfg.functional_loss is not None and self.fc_scheduler.get_lr() > 0 and start_func_finetuning: 
                 #     self._enable_functional_training()
