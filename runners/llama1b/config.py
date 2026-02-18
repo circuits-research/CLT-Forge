@@ -4,10 +4,10 @@ from clt.config.clt_training_runner_config import CLTTrainingRunnerConfig
 from infra.wandb_utils import get_synced_wandb_id
 
 def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: bool = False):
-    MODEL = "gpt2"
+    MODEL = "meta-llama/Llama-3.2-1B"
 
     # Training type in ["None", "ddp", "sfdp", "feature_sharding"]
-    distributed_setup = "ddp" if not generation else "None"
+    distributed_setup = "feature_sharding" if not generation else "None"
     
     ### IMPORTANT, where activations will be stored (around 1-2TB)
     artifact_root = "/fast/fdraye/clt"
@@ -33,14 +33,14 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
 
     cfg = CLTTrainingRunnerConfig(
         device="cuda",
-        dtype="bfloat16",
+        dtype="float16",
         seed=42,
         n_checkpoints=0,
         checkpoint_path=str(checkpoints_root),
         logger_verbose=(rank==0),
         model_class_name="HookedTransformer",
         model_name=MODEL,
-        dataset_path="apollo-research/Skylion007-openwebtext-tokenizer-gpt2",
+        dataset_path="chanind/openwebtext-llama3",
         context_size=16,
         from_pretrained_path=None,
         d_in=768,
@@ -51,10 +51,9 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
         n_train_batch_per_buffer=16, # depends on the size of your buffer
         total_training_tokens=total_training_tokens,
         train_batch_size_tokens=train_batch_size_tokens,
-        gradient_accumulation_steps=1,
         adam_beta1=0.9,
         adam_beta2=0.999,
-        lr=1.5 * 2e-4,
+        lr=2e-4,
         lr_warm_up_steps=lr_warm_up_steps,
         lr_decay_steps=lr_decay_steps,
         final_lr_scale=final_lr_scale,

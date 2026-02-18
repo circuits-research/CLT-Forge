@@ -101,7 +101,7 @@ class CLTTrainingRunner:
         )
 
         if self.cfg.from_pretrained_path is not None:
-            self.clt = CLT.load_from_pretrained(
+            self.clt = CLT._load_from_pretrained(
                 self.cfg.from_pretrained_path,
                 self.cfg.device,
                 is_sharded=self.cfg.is_sharded,

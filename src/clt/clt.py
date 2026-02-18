@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.distributed.nn.functional import all_reduce
+import torch.nn.functional as F
 from jaxtyping import Float
 from pathlib import Path
 from safetensors.torch import save_file, load_file
@@ -182,19 +183,23 @@ class CLT(nn.Module):
         """
 
         if layer is None: 
-            hidden_pre = torch.einsum(
+            hidden_pre = (torch.einsum( # double check einsum and autocast
                 "bnd,ndk->bnk",
-                x,
-                self.W_enc,
-            ) + self.b_enc
+                x.float(),
+                self.W_enc.float(),
+            ) + self.b_enc.float()).to(x.dtype)
 
-            thresh = torch.exp(self.log_threshold) #shape [N_layers, d_latent]
+            thresh = torch.exp(self.log_threshold.float()) #shape [N_layers, d_latent]
         else: 
             assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
-            hidden_pre = x @ self.W_enc[layer] + self.b_enc[layer]
+            hidden_pre = F.linear(
+                x,
+                self.W_enc[layer].T,
+                self.b_enc[layer]
+            )            
             thresh = torch.exp(self.log_threshold[layer]) 
         
-        feat_act = JumpReLU.apply(hidden_pre, thresh, self.bandwidth)
+        feat_act = JumpReLU.apply(hidden_pre.float(), thresh, self.bandwidth).to(hidden_pre.dtype)
         return feat_act, hidden_pre
 
     def decode(
@@ -294,18 +299,18 @@ class CLT(nn.Module):
         act_pred = self.decode(feat_act)
 
         ### MSE loss
-        mse_loss_tensor = torch.nn.functional.mse_loss(act_out, act_pred, reduction="none")
+        mse_loss_tensor = torch.nn.functional.mse_loss(act_out.float(), act_pred.float(), reduction="none")
         mse_loss_accross_layers = mse_loss_tensor.sum(dim=-1).mean(dim=0)
         mse_loss = mse_loss_accross_layers.sum()
         
         if self.cfg.cross_layer_decoders:
-            squared_norms = (self.W_dec**2).sum(dim=2)
-            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask, squared_norms)) 
+            squared_norms = (self.W_dec.float()**2).sum(dim=2)
+            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask.float(), squared_norms)) 
         else: 
-            feature_norms_local = self.W_dec.norm(dim=2)
+            feature_norms_local = self.W_dec.float().norm(dim=2)
         
         # Compute L0 loss local
-        weighted_activations = feat_act * feature_norms_local
+        weighted_activations = feat_act.float() * feature_norms_local
         tanh_weighted_activations = torch.tanh(C_l0_COEF * weighted_activations)
         l0_loss_accross_layers = l0_coef * tanh_weighted_activations.sum(dim=-1).mean(dim=0)
         l0_loss = l0_loss_accross_layers.sum()
@@ -321,7 +326,7 @@ class CLT(nn.Module):
             self.log_loss_debug(feat_act, feature_norms_local, l0_loss)
                 
         ### Dead feature penalty 
-        dead_feature_loss = df_coef * torch.relu(torch.exp(self.log_threshold) - hidden_pre) * feature_norms_local
+        dead_feature_loss = df_coef * torch.relu(torch.exp(self.log_threshold.float()) - hidden_pre.float()) * feature_norms_local
         dead_feature_loss = dead_feature_loss.sum(dim=-1).mean(dim=0).sum()
 
         # SUM losses across ranks using autograd-aware all_reduce
@@ -389,9 +394,30 @@ class CLT(nn.Module):
                 json.dump(cfg_dict, f)
 
         return cfg_path
-    
+            
+    @torch.no_grad()
+    def set_decoder_norm_to_unit_norm(self):
+        self.W_dec.data /= torch.norm(self.W_dec.data, dim=2, keepdim=True)
+
     @classmethod
-    def load_from_pretrained(cls, path: Union[str, Path], device: str, is_sharded: bool = False, rank: Optional[int] = None, world_size: Optional[int] = None, model_name: Optional[str] = "gpt2") -> "CLT":
+    def load_from_pretrained(cls, path: Union[str, Path], device: str = "cpu") -> "CLT":
+        path = Path(path)
+
+        cfg_path = path / CLT_CFG_FILENAME
+        with cfg_path.open("r") as f:
+            cfg_dict = json.load(f)
+
+        if cfg_dict.get("is_sharded", False):
+            return _load_full_sharded_clt(path, device=device)
+        else:
+            return CLT._load_from_pretrained(
+                path,
+                device=device,
+                is_sharded=False,
+            )
+
+    @classmethod
+    def _load_from_pretrained(cls, path: Union[str, Path], device: str, is_sharded: bool = False, rank: Optional[int] = None, world_size: Optional[int] = None) -> "CLT":
         path = Path(path)
 
         if is_sharded:
@@ -403,7 +429,7 @@ class CLT(nn.Module):
 
         cfg_path = path / CLT_CFG_FILENAME
         weights_path = path / f"{prefix}{CLT_WEIGHTS_FILENAME}"
-
+        
         with cfg_path.open("r") as f:
             cfg_dict = json.load(f)
 
@@ -428,6 +454,67 @@ class CLT(nn.Module):
 
         clt.to(torch.device(device))
         return clt
-    @torch.no_grad()
-    def set_decoder_norm_to_unit_norm(self):
-        self.W_dec.data /= torch.norm(self.W_dec.data, dim=2, keepdim=True)
+
+def _load_full_sharded_clt(path: Union[str, Path], device: str = "cpu") -> "CLT": # might be huge, should be CPU by default
+    """
+    Loads a feature sharded CLT into one normal CLT
+    """
+    path = Path(path)
+
+    cfg_path = path / CLT_CFG_FILENAME
+    with cfg_path.open("r") as f:
+        cfg_dict = json.load(f)
+
+    if not cfg_dict.get("is_sharded", False):
+        raise ValueError("This function should be called for feature sharded CLTs")
+
+    world_size = cfg_dict.get(
+        "world_size",
+        len(list(path.glob("rank*_*.safetensors")))
+    )
+
+    shards = [ # load from pretrained with device = cpu and rank != 0 is fine there.
+        CLT._load_from_pretrained(
+            path,
+            device=device,
+            is_sharded=True,
+            rank=r,
+            world_size=world_size,
+        )
+        for r in range(world_size)
+    ]
+
+    # Explicit merge
+    full_sd = {}
+    full_sd["W_enc"] = torch.cat([s.W_enc.data for s in shards], dim=2)
+    full_sd["b_enc"] = torch.cat([s.b_enc.data for s in shards], dim=1)
+    full_sd["W_dec"] = torch.cat([s.W_dec.data for s in shards], dim=1)
+    full_sd["b_dec"] = shards[0].b_dec.data  # replicated
+    full_sd["log_threshold"] = torch.cat(
+        [s.log_threshold.data for s in shards], dim=1
+    )
+    full_sd["estimated_norm_scaling_factor_in"] = shards[0].estimated_norm_scaling_factor_in
+    full_sd["estimated_norm_scaling_factor_out"] = shards[0].estimated_norm_scaling_factor_out
+
+    if hasattr(shards[0], "l_idx"):
+        full_sd["l_idx"] = shards[0].l_idx
+        full_sd["k_idx"] = shards[0].k_idx
+        full_sd["layer_mask"] = shards[0].layer_mask
+
+    # Build full model
+    cfg_dict["device"] = device
+    cfg_dict["is_sharded"] = False
+    cfg = CLTConfig.from_dict(cfg_dict)
+
+    clt = CLT(cfg)
+    missing, unexpected = clt.load_state_dict(full_sd, strict=True)
+
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Incompatible merged checkpoint.\n"
+            f"missing: {missing}\n"
+            f"unexpected: {unexpected}"
+        )
+
+    clt.to(device)
+    return clt

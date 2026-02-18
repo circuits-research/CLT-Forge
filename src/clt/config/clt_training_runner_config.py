@@ -49,6 +49,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     distributed_setup: str = "feature_sharding"
     total_training_tokens: int = 100_000_000
     train_batch_size_tokens: int = 4096 # should be divisible by the context
+    gradient_accumulation_steps: int = 1
     adam_beta1: float = 0.0
     adam_beta2: float = 0.999
     lr: float = 1e-5
@@ -226,6 +227,10 @@ class CLTTrainingRunnerConfig(BaseModel):
         logger.info("d_latent        : %d", self.d_latent)
         logger.info("total tokens    : %.3e", self.total_training_tokens)
         logger.info("batch (tokens)  : %d", self.train_batch_size_tokens)
+        if self.gradient_accumulation_steps > 1:
+            effective_batch_size = self.train_batch_size_tokens * self.gradient_accumulation_steps
+            logger.info("grad accum steps: %d", self.gradient_accumulation_steps)
+            logger.info("effective batch : %d", effective_batch_size)
         total_steps = self.total_training_tokens // self.train_batch_size_tokens
         logger.info("total steps     : %d", total_steps)
         n_tokens_per_buffer = (
@@ -255,7 +260,8 @@ class CLTTrainingRunnerConfig(BaseModel):
     
     @property
     def total_training_steps(self) -> int:
-        return int(self.total_training_tokens // self.train_batch_size_tokens)
+        n_training_steps = int(self.total_training_tokens // self.train_batch_size_tokens)
+        return n_training_steps // self.gradient_accumulation_steps
 
     @property
     def is_distributed(self) -> bool:
