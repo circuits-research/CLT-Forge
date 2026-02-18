@@ -2,8 +2,6 @@
   <img src="./images/image.png" alt="CLT banner" width="800"/>
 </p>
 
-# CLT
-
 [![Python](https://img.shields.io/badge/python-3.11-blue)]()
 [![PyTorch](https://img.shields.io/badge/framework-pytorch-red)]()
 [![Poetry](https://img.shields.io/badge/packaging-poetry-cyan)]()
