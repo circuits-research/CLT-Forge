@@ -28,6 +28,8 @@ We also plan to release within the same package (end of February 2026):
   - Similar in spirit (but simpler) to [Neuronpedia](https://github.com/hijohnnylin/neuronpedia)
   - Including attention attribution support (as in [SparseAttention](https://arxiv.org/abs/2512.05865))
 
+We welcome contributions to the library. Please refer to [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and templates. If you are interested in collaboration, you can also request access to the following [document](https://docs.google.com/document/d/1-qi6uROKHPxac0zID1EcSASDpi4Q2RIa-nDFiXJq2bw/edit?usp=sharing) with cool CLT improvement ideas. Finally, if you have any questions or want to discuss potential improvements/collaboration, write to us on the [librabry discord](https://discord.gg/q5cHK39E) !
+
 ## Quick Start
 
 Training happens in **two steps**:
