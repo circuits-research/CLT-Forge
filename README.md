@@ -7,13 +7,13 @@
 [![Poetry](https://img.shields.io/badge/packaging-poetry-cyan)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**CircuitLab** is a Python library for training Cross-Layer Transcoders (CLTs) at scale. It will soon include an automatic intepretability pipeline and a visual interface. 
+**CircuitLab** is a Python library for training [Cross-Layer Transcoders](https://transformer-circuits.pub/2025/attribution-graphs/methods.html) (CLTs) at scale. It will soon include an automatic intepretability pipeline and a visual interface. 
 
 We believe that a major limitation in the development of CLTs, and more broadly attribution graph methods, is the significant engineering effort required to train, analyze, and iterate on them. This library aims to reduce that overhead by providing a clean, scalable, and extensible framework.
 
 ## Features
 
-This library currently implements L1-regularized JumpReLU CLTs with the following design principles:
+This library currently implements L1-regularized [JumpReLU](https://arxiv.org/pdf/2407.14435) CLTs with the following design principles:
 
 - Follows [Anthropic](https://transformer-circuits.pub/2025/january-update/index.html)'s training guidelines
 - Supports feature sharding across GPUs (as well as DDP and FSDP)  
