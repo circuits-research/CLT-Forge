@@ -1,10 +1,12 @@
 import torch
 from circuitlab.attribution.attribution import AttributionRunner
+import os
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # should run on a single GPU
 
 def main():
-    clt_checkpoint = "/home/fdraye/projects/featflow/checkpoints/gpt2/d1s3fw30/final_26141696"
+    clt_checkpoint = "/fast/fdraye/data/featflow/cache/checkpoints/gpt2/d1s3fw30/middle_22137856"
     model_name = "gpt2"
 
     test_strings = [
@@ -15,6 +17,7 @@ def main():
     # where to save the attribution_graph.pt
     folder_name = "/home/fdraye/projects/circuitlab/save"
 
+    print("Creating Attribution Runner")
     runner = AttributionRunner(
         clt_checkpoint=clt_checkpoint,
         model_name=model_name,
@@ -43,7 +46,6 @@ def main():
             print(f"Attribution computation failed: {e}")
             import traceback
             traceback.print_exc()
-
 
 if __name__ == "__main__":
     main()

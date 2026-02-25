@@ -2,8 +2,8 @@ import torch
 from pathlib import Path
 from circuitlab import logger
 from circuitlab.clt import CLT
-from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
-from circuit_tracer import ReplacementModel
+from circuitlab.vendor.circuit_tracer.circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
+from circuitlab.vendor.circuit_tracer.circuit_tracer import ReplacementModel
 
 def load_circuit_tracing_clt_from_local(
     clt_checkpoint: str,

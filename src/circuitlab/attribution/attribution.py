@@ -10,8 +10,8 @@ from circuitlab.attribution.intervention import (
     run_intervention_per_feature,
 )
 
-from circuit_tracer import ReplacementModel, attribute
-from circuit_tracer.graph import prune_graph, compute_graph_scores
+from circuitlab.vendor.circuit_tracer.circuit_tracer import ReplacementModel, attribute
+from circuitlab.vendor.circuit_tracer.circuit_tracer.graph import prune_graph, compute_graph_scores
 
 import os
 import torch
@@ -29,7 +29,7 @@ class AttributionRunner:
 
         def log(msg):
             if self.debug:
-                logger.debug(msg)
+                logger.info(msg)
 
         self.log = log
 
@@ -133,8 +133,11 @@ class AttributionRunner:
         )
 
         if self.debug:
-            self.log(f"Adjacency shape: {graph.adjacency_matrix.shape}")
             self.log(f"Sparse adjacency shape: {prune_result.edge_mask.shape}")
+
+        n_features = graph.active_features.shape[0]
+        self.log(f"Number of features before pruning: {n_features}")
+        self.log(f"Number of feature after pruning (not counting error nodes): {prune_result.node_mask[:n_features].sum().item()}")
 
         result = self._build_result(graph, prune_result, input_string)
 

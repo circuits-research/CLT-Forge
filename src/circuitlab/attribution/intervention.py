@@ -3,7 +3,7 @@ from circuitlab import logger
 import torch
 from typing import List, Dict, Any, Tuple
 
-from circuit_tracer import ReplacementModel
+from circuitlab.vendor.circuit_tracer.circuit_tracer import ReplacementModel
 
 def _decode_top_tokens(model, probs, top_k: int):
     top_tokens = torch.topk(probs, top_k)
@@ -26,7 +26,7 @@ def run_intervention(
 
     def log(msg):
         if debug:
-            logger.debug(msg)
+            logger.info(msg)
 
     # Convert to expected format (layer, pos, feature_idx, value)
     features_to_intervene = [
@@ -35,7 +35,6 @@ def run_intervention(
     ]
 
     input_tokens = model.ensure_tokenized(input_string)
-    log(f"Input tokens: {input_tokens}")
 
     intervened_logits, _ = model.feature_intervention(
         input_tokens,
@@ -92,10 +91,9 @@ def run_intervention_per_feature(  # useful for the visual interface
 
     def log(msg):
         if debug:
-            logger.debug(msg)
+            logger.info(msg)
 
     input_tokens = model.ensure_tokenized(input_string)
-    log(f"Input tokens: {input_tokens}")
     data = result
 
     feature_indices = data["feature_indices"]
