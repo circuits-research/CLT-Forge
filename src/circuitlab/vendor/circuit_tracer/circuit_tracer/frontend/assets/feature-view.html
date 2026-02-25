@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=1000, initial-scale=1'>
+<link rel='stylesheet' href='./style.css'>
+<title>Features Viewer</title>
+
+<div class='tooltip tooltip-hidden'></div>
+<div class='link'><a href='./index.html'>← Back to Attribution Graphs</a></div>
+<div class='header'>
+  <h1>Features Viewer</h1>
+  <div class='feature-selector'></div>
+</div>
+<div class='features-container'></div>
+
+<link rel='stylesheet' href='./feature_examples/feature-examples.css'>
+
+<script src='https://transformer-circuits.pub/2025/attribution-graphs/static_js/lib/hotserver-client-ws.js'></script>
+<script src='https://transformer-circuits.pub/2025/attribution-graphs/static_js/lib/d3.js'></script>
+<script src='https://transformer-circuits.pub/2025/attribution-graphs/static_js/lib/jetpack_2024-07-20.js'></script>
+<script src='https://transformer-circuits.pub/2025/attribution-graphs/static_js/lib/npy_v0.js'></script>
+
+<script src='./feature_examples/init-feature-examples-list.js'></script>
+<script src='./feature_examples/init-feature-examples-logits.js'></script>
+<script src='./feature_examples/init-feature-examples.js'></script>
+
+<script src='./util.js'></script>
+
+<script>
+window.init = async function(){
+  // Get model from query params or use default
+  const MODEL = util.params.get('model') || 'gemma-2-2b';
+  
+  // Construct base path for feature files
+  const FEATURES_PATH = `./features/${MODEL}`;
+  
+  // State management
+  window.visState = window.visState || {
+    featureId: util.params.get('featureId') || 0,
+    model: MODEL
+  };
+  
+  // Setup feature selector
+  async function setupFeatureSelector() {
+    // Get featureId from URL or use default
+    const featureId = +visState.featureId;
+    
+    // Add selector interface - text input and navigation buttons
+    const selectorSel = d3.select('.feature-selector').html('')
+      .append('div')
+      .style('display', 'flex')
+      .style('align-items', 'center');
+    
+    // Previous button
+    selectorSel.append('button')
+      .text('←')
+      .style('margin-right', '8px')
+      .on('click', () => {
+        const newFeatureId = Math.max(0, featureId - 1);
+        updateFeature(newFeatureId);
+      });
+    
+    // Text input for direct feature number entry
+    selectorSel.append('input')
+      .attr('type', 'number')
+      .attr('min', 0)
+      .attr('value', featureId)
+      .style('width', '120px')
+      .style('text-align', 'center')
+      .on('change', function() {
+        const newFeatureId = Math.max(0, +this.value);
+        updateFeature(newFeatureId);
+      });
+    
+    // Next button
+    selectorSel.append('button')
+      .text('→')
+      .style('margin-left', '8px')
+      .on('click', () => {
+        const newFeatureId = featureId + 1;
+        updateFeature(newFeatureId);
+      });
+    
+    // Render the selected feature
+    renderFeature(FEATURES_PATH, featureId);
+  }
+  
+  // Update feature and URL
+  function updateFeature(featureId) {
+    visState.featureId = featureId;
+    util.params.set('featureId', featureId);
+    
+    // Update input value
+    d3.select('.feature-selector input').property('value', featureId);
+    
+    renderFeature(FEATURES_PATH, featureId);
+  }
+  
+  // Render a feature
+  function renderFeature(path, featureIndex) {
+    const containerSel = d3.select('.features-container').html('');
+    
+    // Initialize the feature examples component
+    const featureExamples = window.initFeatureExamples({
+      containerSel: containerSel,
+      showLogits: true,
+      showExamples: true,
+    });
+    
+    // Update document title to include model name
+    const modelName = visState.model.split('/').pop();
+    document.title = `Feature ${featureIndex} - ${modelName} Features Viewer`;
+    
+    // Load and render the selected feature
+    featureExamples.renderFeature(path, featureIndex);
+  }
+  
+  // Handle browser navigation (back/forward)
+  d3.select(window).on('popstate.updateState', ev => {
+    if (!ev.state) return;
+    ev.preventDefault();
+    
+    const newFeatureId = util.params.get('featureId');
+    const newModel = util.params.get('model') || 'default';
+    
+    if (newModel !== visState.model) {
+      // If model changed, refresh the page to reset everything
+      window.location.reload();
+      return;
+    }
+    
+    if (newFeatureId && newFeatureId !== visState.featureId) {
+      updateFeature(+newFeatureId);
+    }
+  });
+  
+  setupFeatureSelector();
+}
+
+window.init();
+</script>
+
+<style>
+.header {
+  margin: 20px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 24px;
+}
+
+.feature-selector {
+  margin-right: 20px;
+  display: flex;
+  align-items: center;
+}
+
+.feature-selector input {
+  padding: 8px;
+  font-size: 16px;
+  border-radius: 4px;
+  border: 1px solid #ccc;
+  width: 120px;
+  text-align: center;
+}
+
+.feature-selector button {
+  padding: 8px 12px;
+  font-size: 16px;
+  border-radius: 4px;
+  border: 1px solid #ccc;
+  background: #f5f5f5;
+  cursor: pointer;
+}
+
+.feature-selector button:hover {
+  background: #e5e5e5;
+}
+
+.features-container {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+</style>

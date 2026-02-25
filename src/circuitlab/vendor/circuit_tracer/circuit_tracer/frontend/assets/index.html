@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=1000, initial-scale=1'>
+<link rel='stylesheet' href='./style.css'>
+<title>Attribution Graphs</title>
+
+<div class='tooltip tooltip-hidden'></div>
+<div class='nav'></div>
+<div class='cg'></div>
+
+<link rel='stylesheet' href='./attribution_graph/cg.css'>
+<link rel='stylesheet' href='./attribution_graph/gridsnap/gridsnap.css'>
+<link rel='stylesheet' href='./feature_examples/feature-examples.css'>
+
+<script src='https://transformer-circuits.pub/2025/attribution-graphs/static_js/lib/hotserver-client-ws.js'></script>
+<script src='https://transformer-circuits.pub/2025/attribution-graphs/static_js/lib/d3.js'></script>
+<script src='https://transformer-circuits.pub/2025/attribution-graphs/static_js/lib/jetpack_2024-07-20.js'></script>
+<script src='https://transformer-circuits.pub/2025/attribution-graphs/static_js/lib/npy_v0.js'></script>
+<script src='https://unpkg.com/dagre@0.8.5/dist/dagre.min.js'></script>
+<script src='https://unpkg.com/pako@2.1.0/dist/pako.min.js'></script>
+
+<script src='./feature_examples/init-feature-examples-list.js'></script>
+<script src='./feature_examples/init-feature-examples-logits.js'></script>
+<script src='./feature_examples/init-feature-examples.js'></script>
+
+<script src='./util.js'></script>
+<script src='./attribution_graph/util-cg.js'></script>
+<script src='./attribution_graph/render-act-histogram.js'></script>
+<script src='./attribution_graph/gridsnap/init-gridsnap.js'></script>
+<script src='./attribution_graph/init-cg-button-container.js'></script>
+<script src='./attribution_graph/init-cg-link-graph.js'></script>
+<script src='./attribution_graph/init-cg-node-connections.js'></script>
+<script src='./attribution_graph/init-cg-clerp-list.js'></script>
+<script src='./attribution_graph/init-cg-feature-detail.js'></script>
+<script src='./attribution_graph/init-cg-feature-scatter.js'></script>
+<script src='./attribution_graph/init-cg-subgraph.js'></script>
+<script src='./attribution_graph/init-cg.js'></script>
+
+<script>
+window.init = async function(){
+  window.isLocalServing = true;
+  var {graphs} = await util.getFile('./data/graph-metadata.json', false)
+
+  window.visState = window.visState || {
+    slug: util.params.get('slug') || graphs[0].slug,
+    clickedId: util.params.get('clickedId')?.replace('null', ''),
+    isGridsnap: util.params.get('isGridsnap')?.replace('null', ''),
+  }
+
+  // Find the current graph metadata
+  var currentGraph = graphs.find(g => g.slug === visState.slug)
+  
+  // Initialize pruningThreshold only if the graph has node_threshold
+  if (currentGraph && typeof currentGraph.node_threshold === 'number') {
+    visState.pruningThreshold = util.params.get('pruningThreshold') || currentGraph.node_threshold || 0.4
+  }
+
+  // Create a container for the controls
+  var navSel = d3.select('.nav').html('')
+    .style('display', 'flex')
+    .style('align-items', 'center')
+    .style('padding-bottom', '15px')
+    .style('justify-content', 'space-between')
+  
+  var controlsContainer = navSel.append('div.controls-container')
+    .style('display', 'flex')
+    .style('align-items', 'center')
+    .style('flex', '1')
+    .style('gap', '20px')
+  
+  var selectSel = controlsContainer.append('select.graph-prompt-select')
+    .style('min-width', '300px')
+    .style('max-width', '600px')
+    .on('click', async function() {
+      // Refetch graphs if local serving
+      if (!window.isLocalServing) return;
+
+      var {graphs: newGraphs} = await util.getFile('./data/graph-metadata.json', false)
+      graphs = newGraphs
+
+      // Rebuild the options
+      selectSel.selectAll('option').remove()
+      selectSel.appendMany('option', graphs)
+        .text(d => {
+          var scanName = util.nameToPrettyPrint[d.scan] || d.scan
+          var prefix = d.title_prefix ? d.title_prefix + ' ' : ''
+          return prefix + scanName + ' — ' + d.prompt
+        })
+        .attr('value', d => d.slug)
+        .property('selected', d => d.slug === visState.slug)
+    })
+    .on('change', function() {
+      visState.slug = this.value
+      visState.clickedId = undefined
+      util.params.set('slug', this.value)
+      
+      // Update pruningThreshold when graph changes
+      var newGraph = graphs.find(g => g.slug === this.value)
+      if (newGraph && typeof newGraph.node_threshold === 'number') {
+        visState.pruningThreshold = util.params.get('pruningThreshold') || newGraph.node_threshold || 0.4
+      } else {
+        delete visState.pruningThreshold
+        util.params.set('pruningThreshold', null)
+      }
+      
+      render()
+    })
+
+  // Create debounced render function
+  var debouncedRender = util.debounce(render, 300)
+  
+  // Slider container will be created dynamically in render function
+  var sliderContainer
+
+  selectSel.appendMany('option', graphs)
+    .text(d => {
+      var scanName = util.nameToPrettyPrint[d.scan] || d.scan
+      var prefix = d.title_prefix ? d.title_prefix + ' ' : ''
+      return prefix + scanName + ' — ' + d.prompt
+    })
+    .attr('value', d => d.slug)
+    .property('selected', d => d.slug === visState.slug)
+
+  // Add save button to the right
+  var saveButton = navSel.append('button.save-button')
+    .text('Save')
+    .style('display', window.isLocalServing ? 'block' : 'none')
+    .on('click', function() {
+      // Get current graph info
+      
+
+      var slug = visState.slug;
+      if (!slug) {
+        console.error("No slug found");
+        return;
+      }
+
+      var url = `/save_graph/${slug}`;
+      
+      // Show loading state
+      saveButton.text("Saving...")
+        .attr("disabled", true)
+        .style("opacity", 0.6);
+      
+      // Send the POST request
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          qParams: Object.fromEntries(["pinnedIds", "supernodes", "linkType", "clickedId", "sg_pos", "pruningThreshold", "clerps"]
+            .map(k => [k, util.params.get(k)])
+            .filter(([k, v]) => v !== undefined && v !== 'null')
+          ),
+          timestamp: new Date().toISOString()
+        })
+      })
+      .then(response => {
+        if (!response.ok) {
+          throw new Error(`HTTP error! Status: ${response.status}`);
+        }
+        return 1;
+        // return response.text();
+      })
+      .then(data => {
+        console.log("Graph saved successfully:", data);
+        saveButton.text("Saved!")
+          .style("background-color", "#e6f7e6")
+          .style("border-color", "#8bc34a");
+        
+        // Reset button after 2 seconds
+        setTimeout(() => {
+          saveButton.text("Save")
+            .attr("disabled", null)
+            .style("opacity", null)
+            .style("background-color", null)
+            .style("border-color", null);
+        }, 2000);
+      })
+      .catch(error => {
+        console.error("Error saving graph:", error);
+        saveButton.text("Error!")
+          .style("background-color", "#ffebee")
+          .style("border-color", "#f44336");
+        
+        // Reset button after 2 seconds
+        setTimeout(() => {
+          saveButton.text("Save")
+            .attr("disabled", null)
+            .style("opacity", null)
+            .style("background-color", null)
+            .style("border-color", null);
+        }, 2000);
+      });
+    });
+
+  function render() {
+    var m = graphs.find(g => g.slug == visState.slug)
+    if (!m) return
+    
+    // Handle slider creation/removal dynamically
+    if (m && typeof m.node_threshold === 'number') {
+      // Create slider if it doesn't exist
+      if (!sliderContainer) {
+        sliderContainer = controlsContainer.append('div.slider-container')
+          .style('display', 'flex')
+          .style('align-items', 'center')
+          .style('gap', '8px')
+        
+        sliderContainer.append('span').text('Pruning:')
+        
+        var sliderSel = sliderContainer.append('input')
+          .attr('type', 'range')
+          .attr('min', 0)
+          .attr('max', m.node_threshold)
+          .attr('step', 0.01)
+          .attr('value', visState.pruningThreshold || m.node_threshold)
+          .on('input', function() {
+            // Update state and UI immediately
+            visState.pruningThreshold = this.value
+            visState.clickedId = util.params.get('clickedId')?.replace('null', '')
+            util.params.set('pruningThreshold', this.value)
+            valueDisplay.text(parseFloat(this.value).toFixed(2))
+            
+            // Debounce the actual render
+            debouncedRender()
+          })
+        
+        var valueDisplay = sliderContainer.append('span.value-display')
+          .text(parseFloat(visState.pruningThreshold || m.node_threshold).toFixed(2))
+      }
+      
+      // Update slider properties for current graph
+      sliderContainer.select('input')
+        .attr('max', m.node_threshold)
+        .property('value', visState.pruningThreshold || m.node_threshold)
+      
+      sliderContainer.select('.value-display')
+        .text(parseFloat(visState.pruningThreshold || m.node_threshold).toFixed(2))
+      
+      sliderContainer.style('display', 'flex')
+      
+      // Ensure pruningThreshold is set
+      if (visState.pruningThreshold === undefined) {
+        visState.pruningThreshold = m.node_threshold
+      }
+    } else {
+      // Remove slider if graph doesn't support pruning
+      if (sliderContainer) {
+        sliderContainer.remove()
+        sliderContainer = null
+      }
+      delete visState.pruningThreshold
+      util.params.set('pruningThreshold', null)
+    }
+
+    d3.select('.cg').html('')
+    
+    // Prepare options for initCg
+    var options = {
+      clickedId: visState.clickedId,
+      clickedIdCb: id => util.params.set('clickedId', id),
+      isGridsnap: visState.isGridsnap || true
+    }
+    
+    // Only add pruningThreshold to options if it exists
+    if (visState.pruningThreshold !== undefined) {
+      options.pruningThreshold = visState.pruningThreshold
+    }
+    
+    initCg(d3.select('.cg'), visState.slug, options)
+
+    selectSel.at({title: m.prompt})
+    document.title = 'Attribution Graph: ' + m.prompt
+  }
+  render()
+}
+
+window.init()
+</script>
