@@ -1,0 +1,24 @@
+name: "ci"
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e .[dev]
+      - name: check formatting
+        run: python -m ruff format --check
+      - name: check linting
+        run: python -m ruff check
+      - name: check types
+        run: python -m pyright
+      - name: run tests
+        run: python -m pytest tests -m "not requires_disk"
