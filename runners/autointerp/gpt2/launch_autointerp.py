@@ -1,67 +1,71 @@
-# import os
-# import sys
-# import torch
-# from pathlib import Path
+"""
+Run a single job:
+    python launch_autointerp.py --job_id 0 --total_jobs 32
 
-# os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+With LLM explanations:
+    python launch_autointerp.py --job_id 0 --total_jobs 32 --generate_explanations
 
-# from circuitlab.config.autointerp_config import AutoInterpConfig
-# from circuitlab.autointerp.pipeline import AutoInterp
+Launch all jobs in parallel:
+    for i in $(seq 0 31); do
+        python launch_autointerp.py --job_id $i --total_jobs 32 &
+    done
+"""
 
-# def main():
-#     print(f"CUDA available: {torch.cuda.is_available()}")
-#     print(f"CUDA device count: {torch.cuda.device_count()}")
+import argparse
+from pathlib import Path
 
-#     job_id = int(sys.argv[1])
-#     total_jobs = int(sys.argv[2])
+import torch  # noqa: F401 — used for cuda availability checks
 
-#     d_in = 768
-#     expansion_factor = 32
-#     d_latent = d_in * expansion_factor
+from circuitlab.config.autointerp_config import AutoInterpConfig
+from circuitlab.autointerp.pipeline_new import AutoInterp
 
-#     clt_path = "/fast/fdraye/data/featflow/cache/checkpoints/gpt2/d1s3fw30/middle_22137856"
 
-#     autointerp_cfg = {
-#         "device": "cuda",  # 👈 NOW GPU matters
-#         "model_name": "gpt2",
-#         "clt_path": clt_path,
-#         "latent_cache_path": "/fast/fdraye/data/featflow/cache/gpt2",
-#         "dataset_path": "apollo-research/Skylion007-openwebtext-tokenizer-gpt2",
-#         "context_size": 16,
-#         "total_autointerp_tokens": 12 * (16 * 4096),
-#         "train_batch_size_tokens": 4096,
-#         "n_batches_in_buffer": 32,
-#         "store_batch_size_prompts": 32,
-#         "d_in": d_in,
-#     }
+def build_config() -> AutoInterpConfig:
+    d_in = 768
+    return AutoInterpConfig(
+        device="cuda",
+        dtype="bfloat16",
+        model_name="gpt2",
+        clt_path="/fast/fdraye/data/featflow/cache/checkpoints/gpt2/d1s3fw30/middle_22137856",
+        latent_cache_path="/fast/fdraye/data/featflow/autointerp/gpt2",
+        dataset_path="apollo-research/Skylion007-openwebtext-tokenizer-gpt2",
+        context_size=16,
+        total_autointerp_tokens=12 * 16 * 4096,   # ~786k tokens
+        train_batch_size_tokens=4096,
+        n_batches_in_buffer=32,
+        store_batch_size_prompts=32,
+        d_in=d_in,
+    )
 
-#     print("Creating AutoInterpConfig...", flush=True)
-#     cfg = AutoInterpConfig(**autointerp_cfg)
 
-#     print("Initializing AutoInterp...", flush=True)
-#     autointerp = AutoInterp(cfg)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run AutoInterp for one job (feature slice).")
+    parser.add_argument("--job_id",    type=int, required=True, help="Job index [0, total_jobs).")
+    parser.add_argument("--total_jobs", type=int, required=True, help="Total number of parallel jobs.")
+    parser.add_argument(
+        "--generate_explanations",
+        action="store_true",
+        default=False,
+        help="Run vLLM to generate LLM explanations (optional, slow).",
+    )
+    args = parser.parse_args()
 
-#     features_per_job = d_latent // total_jobs
-#     start_idx = job_id * features_per_job
-#     end_idx = start_idx + features_per_job if job_id < total_jobs - 1 else d_latent
-#     index_list = list(range(start_idx, end_idx))
+    print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
+    print(f"CUDA device count: {torch.cuda.device_count()}", flush=True)
+    print(f"[Job {args.job_id}/{args.total_jobs}] Starting…", flush=True)
 
-#     print(
-#         f"[Job {job_id}/{total_jobs}] "
-#         f"Processing features {start_idx} → {end_idx - 1} "
-#         f"({len(index_list)} features)",
-#         flush=True,
-#     )
+    cfg = build_config()
+    autointerp = AutoInterp(cfg)
+    autointerp.run(
+        job_id=args.job_id,
+        total_jobs=args.total_jobs,
+        top_k=100,
+        save_dir=Path(cfg.latent_cache_path),
+        generate_explanations=args.generate_explanations,
+    )
 
-#     autointerp.run(
-#         worker_id=f"{job_id}",
-#         index_list=index_list,
-#         top_k=100,
-#         save_dir=Path(cfg.latent_cache_path),
-#     )
+    print(f"[Job {args.job_id}] DONE", flush=True)
 
-#     print(f"[Job {job_id}] DONE", flush=True)
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()
