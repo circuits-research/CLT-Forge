@@ -1,4 +1,5 @@
 """
+AutoInterp pipeline — streaming, feature-parallel, single-pass.
 Storage layout:
     save_dir/
       features/
@@ -32,6 +33,22 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 TOP_K_DEFAULT = 100
 N_TOP_ACTIVATING_TOKENS_SHOWN = 4
+
+# DDL shared by _save_to_sqlite and merge_job_databases
+_FEATURES_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS features (
+        layer                 INTEGER NOT NULL,
+        feature_id            INTEGER NOT NULL,
+        average_activation    REAL    NOT NULL,
+        top_examples          TEXT    NOT NULL,
+        top_examples_tks      TEXT    NOT NULL,
+        top_activating_tokens TEXT    NOT NULL,
+        description           TEXT    NOT NULL,
+        explanation           TEXT    NOT NULL,
+        raw_explanation       TEXT    NOT NULL,
+        PRIMARY KEY (layer, feature_id)
+    )
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +140,7 @@ class AutoInterp:
             state=state, index_list=index_list, top_k=top_k
         )
 
-        self._save_feature_dicts(
+        self._save_to_sqlite(
             feature_dicts_by_layer=feature_dicts_by_layer,
             job_id=job_id,
             save_dir=save_dir,
@@ -413,26 +430,52 @@ class AutoInterp:
     # Saving
     # ------------------------------------------------------------------
 
-    def _save_feature_dicts(
+    def _save_to_sqlite(
         self,
         *,
         feature_dicts_by_layer: List[Dict[str, Dict[str, Any]]],
         job_id: int,
         save_dir: Path,
-    ) -> None:
+    ) -> Path:
         """
-        Write one compact JSON per layer per job.
-        Total files = N_jobs × N_layers (e.g. 32 × 12 = 384 for GPT-2).
+        Persist all features for this job in a single SQLite database.
+
+        Output: save_dir/job_{job_id}.db  — one file per job regardless of
+        how many layers or features it contains.
+
+        Query specific features later with load_features(db_path, layer, [ids]).
+        Merge all jobs with merge_job_databases([...], output_db_path).
         """
-        for layer, layer_dicts in enumerate(feature_dicts_by_layer):
-            layer_dir = save_dir / "features" / f"layer_{layer}"
-            layer_dir.mkdir(parents=True, exist_ok=True)
-            (layer_dir / f"job_{job_id}.json").write_text(
-                json.dumps(layer_dicts, separators=(",", ":"))
+        import sqlite3
+
+        db_path = save_dir / f"job_{job_id}.db"
+        con = sqlite3.connect(db_path)
+        con.execute(_FEATURES_TABLE_DDL)
+
+        rows = [
+            (
+                d["layer"],
+                d["feature_index"],
+                d["average_activation"],
+                json.dumps(d["top_examples"]),
+                json.dumps(d["top_examples_tks"]),
+                json.dumps(d["top_activating_tokens"]),
+                d["description"],
+                d["explanation"],
+                d["raw_explanation"],
             )
-        logger.info(
-            f"[Job {job_id}] Feature dicts saved under {save_dir / 'features'}"
+            for layer_dicts in feature_dicts_by_layer
+            for d in layer_dicts.values()
+        ]
+
+        con.executemany(
+            "INSERT OR REPLACE INTO features VALUES (?,?,?,?,?,?,?,?,?)", rows
         )
+        con.commit()
+        con.close()
+
+        logger.info(f"[Job {job_id}] Saved {len(rows)} features → {db_path}")
+        return db_path
 
     # ------------------------------------------------------------------
     # Optional LLM explanations
@@ -446,58 +489,43 @@ class AutoInterp:
         save_dir: Path,
     ) -> None:
         """
-        For each non-dead feature: build a prompt, batch through vLLM,
-        parse the response, update the in-memory dict, re-save.
+        Build prompts in-memory, run vLLM, parse responses, patch the
+        in-memory dicts, and re-save to SQLite.  No files are written.
         """
         from circuitlab.autointerp.client import run_client
         from circuitlab.autointerp.prompt import generate_prompt
 
-        prompt_dir     = save_dir / "prompts"
-        explanation_dir = save_dir / "explanations"
-        prompt_dir.mkdir(parents=True, exist_ok=True)
-        explanation_dir.mkdir(parents=True, exist_ok=True)
-
-        prompt_paths: List[Path] = []
+        prompt_texts: List[str] = []
         feat_layer_keys: List[Tuple[int, str]] = []
 
         for layer, layer_dicts in enumerate(feature_dicts_by_layer):
             for feat_key, feat_dict in layer_dicts.items():
                 if not feat_dict["top_examples"]:
                     continue  # dead feature — skip
-
-                prompt = generate_prompt(
-                    feat_dict["top_examples"], layer, int(feat_key)
+                prompt_texts.append(
+                    generate_prompt(feat_dict["top_examples"], layer, int(feat_key))
                 )
-                p = prompt_dir / f"job{job_id}_L{layer}_F{feat_key}.txt"
-                p.write_text(prompt)
-                prompt_paths.append(p)
                 feat_layer_keys.append((layer, feat_key))
 
-        if not prompt_paths:
+        if not prompt_texts:
             logger.info(f"[Job {job_id}] No live features — skipping vLLM.")
             return
 
-        run_client(
-            prompts=prompt_paths,
-            out_dir=explanation_dir,
+        explanations = run_client(
+            prompts=prompt_texts,
             vllm_model=self.cfg.vllm_model,
             vllm_max_tokens=self.cfg.vllm_max_tokens,
         )
 
-        # Patch explanations back into the in-memory dicts
-        for p, (layer, feat_key) in zip(prompt_paths, feat_layer_keys):
-            exp_file = explanation_dir / p.name
-            if not exp_file.exists():
-                continue
-            raw = exp_file.read_text().strip()
+        for raw, (layer, feat_key) in zip(explanations, feat_layer_keys):
             desc, expl = _parse_explanation(raw)
             d = feature_dicts_by_layer[layer][feat_key]
             d["raw_explanation"] = raw
             d["description"]     = desc
             d["explanation"]     = expl
 
-        # Re-save with explanations filled in
-        self._save_feature_dicts(
+        # Re-save to SQLite with explanations filled in
+        self._save_to_sqlite(
             feature_dicts_by_layer=feature_dicts_by_layer,
             job_id=job_id,
             save_dir=save_dir,
@@ -665,3 +693,85 @@ def _parse_explanation(raw: str) -> Tuple[str, str]:
         elif line.startswith("[EXPLANATION]:"):
             explanation = line[len("[EXPLANATION]:"):].strip()
     return description, explanation
+
+
+# ---------------------------------------------------------------------------
+# Public utilities for loading and merging results
+# ---------------------------------------------------------------------------
+
+def load_features(
+    db_path: Path,
+    layer: int,
+    feature_ids: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Load feature dicts from a job SQLite database.
+
+    Args:
+        db_path:     Path to a job_{j}.db file (or merged features.db).
+        layer:       Which CLT layer to query.
+        feature_ids: Specific feature IDs to load.  None → all for this layer.
+
+    Returns:
+        List of feature dicts with JSON fields already deserialized.
+
+    Example:
+        features = load_features(Path("save_dir/job_0.db"), layer=3)
+        feature  = load_features(Path("save_dir/features.db"), layer=3, feature_ids=[1234])
+    """
+    import sqlite3
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+
+    if feature_ids is None:
+        cursor = con.execute(
+            "SELECT * FROM features WHERE layer = ?", (layer,)
+        )
+    else:
+        placeholders = ",".join("?" * len(feature_ids))
+        cursor = con.execute(
+            f"SELECT * FROM features WHERE layer = ? AND feature_id IN ({placeholders})",
+            (layer, *feature_ids),
+        )
+
+    rows = cursor.fetchall()
+    con.close()
+
+    result = []
+    for row in rows:
+        d = dict(row)
+        d["top_examples"]          = json.loads(d["top_examples"])
+        d["top_examples_tks"]      = json.loads(d["top_examples_tks"])
+        d["top_activating_tokens"] = json.loads(d["top_activating_tokens"])
+        result.append(d)
+    return result
+
+
+def merge_job_databases(job_db_paths: List[Path], output_db_path: Path) -> None:
+    """
+    Merge all per-job SQLite databases into one file.
+
+    Typical use after all jobs have finished:
+        merge_job_databases(
+            sorted(save_dir.glob("job_*.db")),
+            save_dir / "features.db",
+        )
+
+    The resulting features.db supports the same load_features() queries
+    across the full feature space.
+    """
+    import sqlite3
+
+    con = sqlite3.connect(output_db_path)
+    con.execute(_FEATURES_TABLE_DDL)
+    con.commit()
+
+    for db_path in job_db_paths:
+        con.execute("ATTACH DATABASE ? AS src", (str(db_path),))
+        con.execute("INSERT OR REPLACE INTO features SELECT * FROM src.features")
+        con.execute("DETACH DATABASE src")
+        con.commit()
+
+    con.close()
+    logger.info(f"Merged {len(job_db_paths)} databases → {output_db_path}")
