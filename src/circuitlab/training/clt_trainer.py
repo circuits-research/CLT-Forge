@@ -476,8 +476,8 @@ class CLTTrainer():
             dist.all_reduce(dead_features_per_layer, op=dist.ReduceOp.SUM)
 
         # metrics for currents acts
-        dead_features_average_count = dead_features_per_layer.mean()
-        l0_across_layers = (feature_acts > 0).sum(-1).mean(0)
+        dead_features_average_count = dead_features_per_layer.float().mean()
+        l0_across_layers = (feature_acts > 0).float().sum(-1).mean(0)
         l0 = l0_across_layers.mean()
         current_learning_rate = self.optimizer.param_groups[0]["lr"]
         per_token_l2_loss = (act_out - act_pred).pow(2).sum(dim=-1) # shape
