@@ -12,17 +12,17 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
     distributed_setup = "feature_sharding" if not generation else "None"
     
     ### IMPORTANT, where activations will be stored (around 1-2TB)
-    activations_root = STORAGE_ROOT / Path("activations") / MODEL
-    checkpoints_root = STORAGE_ROOT / Path("checkpoints") / MODEL
+    activations_root = STORAGE_ROOT / Path("activations") / f"{MODEL}"
+    checkpoints_root = STORAGE_ROOT / Path("checkpoints") / f"{MODEL}"
 
-    gradient_accumulation_steps = 4
-    total_training_steps = 200_000 // world_size
-    train_batch_size_tokens = world_size * 2048
+    gradient_accumulation_steps = 1
+    total_training_steps = 300_000 // world_size
+    train_batch_size_tokens = world_size * 1024
     total_training_tokens = gradient_accumulation_steps * train_batch_size_tokens * total_training_steps
 
     lr_decay_steps = (total_training_steps // 20) - 1
     final_lr_scale = 0.0
-    lr_warm_up_steps = 10
+    lr_warm_up_steps = 1000
 
     l0_waiting_steps = 0
     l0_warm_up_steps = int(0.7 * total_training_steps) - l0_waiting_steps - 1

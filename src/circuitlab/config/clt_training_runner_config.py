@@ -27,6 +27,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     is_multilingual_split_dataset: bool = False # can be ignored, it is only for multilingual datasets processing
     split: str = "train"
     disk: bool = False # use load_from_disk instead and local dataset
+    streaming: bool = False
 
     # -----CLT parameters---------------------
     from_pretrained_path: str | None = None

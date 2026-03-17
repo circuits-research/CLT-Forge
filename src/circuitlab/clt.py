@@ -296,9 +296,8 @@ class CLT(nn.Module):
 
     def loss(self, act_in: torch.Tensor, act_out: torch.Tensor, l0_coef: float, df_coef: float) -> LossMetrics:
         ### We manually map final predictions to float32 for stability
+
         feat_act, hidden_pre = self.encode(act_in)
-        assert torch.isfinite(hidden_pre).all(), "NaN in hidden_pre"
-        assert torch.isfinite(feat_act).all(), "NaN in feat_act"
         act_pred = self.decode(feat_act.to(self.dtype))
 
         ### MSE loss

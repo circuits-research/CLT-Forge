@@ -22,7 +22,7 @@ def main(job_id: int, total_jobs: int):
     cached_activations_path = cfg.cached_activations_path
     cfg.cached_activations_path = None
 
-    total_splits = 128
+    total_splits = 128 * 30
     split_begin_idx, split_end_idx = compute_job_split_range(
         job_id=job_id,
         total_jobs=total_jobs,
@@ -30,7 +30,7 @@ def main(job_id: int, total_jobs: int):
     )
 
     # number of token activations to save, could more than total_training_tokens 
-    number_of_tokens = 8_000_000
+    number_of_tokens = 300_000_000
 
     print(f"Job {job_id}: Processing splits {split_begin_idx} to {split_end_idx-1}")
 
@@ -49,7 +49,7 @@ def main(job_id: int, total_jobs: int):
     compression_config = CompressionConfig(
         quantization="int8",
         compression="zstd", 
-        compression_level=3, # lower if too slow, personal experience, it is worth waiting
+        compression_level=2, # lower if too slow, personal experience, it is worth waiting
     )
 
     activations_store = ActivationsStore(

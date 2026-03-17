@@ -1,0 +1,1 @@
+- fix the normalization issue, need to decide where we normalize, ideally when the data is on the GPU already, but then, what about the estimated_norm_scaling factor, should it be computed on the GPU ? Once this is done, the whole thing should be much faster, and it all finally makes sense !!!

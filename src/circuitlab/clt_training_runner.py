@@ -153,7 +153,11 @@ class CLTTrainingRunner:
                 name=self.cfg.run_name,
                 id=self.cfg.wandb_id,
             )
-  
+
+            # Make tokens the global x-axis for all metrics
+            wandb.define_metric("tokens")
+            wandb.define_metric("*", step_metric="tokens")
+
         trainer = CLTTrainer(
             clt=self.clt,
             activations_store=self.activations_store,

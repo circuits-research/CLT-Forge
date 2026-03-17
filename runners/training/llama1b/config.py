@@ -2,7 +2,8 @@ from pathlib import Path
 from circuitlab.config.clt_training_runner_config import CLTTrainingRunnerConfig
 from circuitlab.infra.wandb_utils import get_synced_wandb_id
 
-STORAGE_ROOT = Path(circuit_labb.__file__).resolve().parents[2] / "storage" # symlink to scratch
+import circuitlab
+STORAGE_ROOT = Path(circuitlab.__file__).resolve().parents[2] / "storage" # symlink to scratch
 
 def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: bool = False):
     MODEL = "meta-llama/Llama-3.2-1B"
@@ -11,12 +12,12 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
     distributed_setup = "feature_sharding" if not generation else "None"
     
     ### IMPORTANT, where activations will be stored (around 1-2TB)
-    activations_root = STORAGE_ROOT / Path("activations") / MODEL.replace("/", "_")
-    checkpoints_root = STORAGE_ROOT / Path("checkpoints") / MODEL.replace("/", "_")
+    activations_root = STORAGE_ROOT / Path("activations") / f"{MODEL.replace('/', '_')}_BF16"
+    checkpoints_root = STORAGE_ROOT / Path("checkpoints") / f"{MODEL.replace('/', '_')}_BF16"
 
     gradient_accumulation_steps = 4
     total_training_steps = 300_000 // world_size
-    train_batch_size_tokens = world_size * 64
+    train_batch_size_tokens = world_size * 128
     total_training_tokens = gradient_accumulation_steps * train_batch_size_tokens * total_training_steps
 
     lr_decay_steps = (total_training_steps // 20) - 1
@@ -37,14 +38,15 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
         model_class_name="HookedTransformer",
         model_name=MODEL,
         dataset_path="chanind/openwebtext-llama3",
+        streaming=True,
         context_size=64,
         from_pretrained_path=None,
         d_in=2048,
-        expansion_factor=48,
+        expansion_factor=32,
         jumprelu_init_threshold=0.03,
         jumprelu_bandwidth=1.0,
         cached_activations_path=str(activations_root),
-        n_train_batch_per_buffer=16, # depends on the size of your buffer
+        n_train_batch_per_buffer=8, # depends on the size of your buffer
         total_training_tokens=total_training_tokens,
         train_batch_size_tokens=train_batch_size_tokens,
         adam_beta1=0.9,
@@ -53,7 +55,7 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
         lr_warm_up_steps=lr_warm_up_steps,
         lr_decay_steps=lr_decay_steps,
         final_lr_scale=final_lr_scale,
-        l0_coefficient=2.0,
+        l0_coefficient=0.02,
         dead_penalty_coef=1e-5,
         dead_feature_window=250,
         l0_warm_up_steps=l0_warm_up_steps,

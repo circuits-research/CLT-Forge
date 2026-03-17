@@ -22,7 +22,7 @@ def main(job_id: int, total_jobs: int):
     cached_activations_path = cfg.cached_activations_path
     cfg.cached_activations_path = None
 
-    total_splits = 1024
+    total_splits = 4196
     split_begin_idx, split_end_idx = compute_job_split_range(
         job_id=job_id,
         total_jobs=total_jobs,
@@ -30,7 +30,7 @@ def main(job_id: int, total_jobs: int):
     )
 
     # number of token activations to save, could more than total_training_tokens 
-    number_of_tokens = 300_000_000
+    number_of_tokens = total_splits * cfg.train_batch_size_tokens * 8 * 8
     print(f"Job {job_id}: Processing splits {split_begin_idx} to {split_end_idx-1}")
 
     if cfg.is_multilingual_split_dataset: 
@@ -61,7 +61,7 @@ def main(job_id: int, total_jobs: int):
         number_of_tokens=number_of_tokens,
         split_begin_idx=split_begin_idx,
         split_end_idx=split_end_idx,
-        use_compression=True,           
+        use_compression=False,           
         compression_config=compression_config, 
     )
 

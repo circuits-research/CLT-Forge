@@ -16,6 +16,7 @@ from circuitlab.training.optim import LearningRateScheduler
 from circuitlab.config import CLTTrainingRunnerConfig
 from circuitlab import logger
 
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 class CLTTrainer():
@@ -96,7 +97,7 @@ class CLTTrainer():
         self.monitoring_l0 = None
         self.accumulation_step: int = 0
 
-    def _initialize_b_enc(self, n_batches: int = 2):
+    def _initialize_b_enc(self, n_batches: int = 5):
 
         model = self._get_clt()
 
@@ -120,7 +121,7 @@ class CLTTrainer():
         x = []
         for _ in batch_iter:
             # consume data synchronously
-            acts_in, _ = (t.to(self.cfg.device) for t in next(self.activations_store.__iter__()))
+            acts_in, _ = next(self.activations_store.__iter__())
             hidden_pre = get_hidden_pre(acts_in.to(model.W_enc.dtype))
             x.append(hidden_pre)
 
@@ -167,72 +168,63 @@ class CLTTrainer():
 
     def fit(self): 
         """ fit a clt """
-        
+                
         # start_func_finetuning = True
         if self.cfg.from_pretrained_path is None:
             self._initialize_b_enc()
+
+        act_iter = iter(self.activations_store)
         
-        while self.n_tokens < self.cfg.total_training_tokens: 
-            *tokens_part, acts_in, acts_out = (
-                t.to(device=self.cfg.device) 
-                for t in next(self.activations_store.__iter__())
+        while self.n_tokens < self.cfg.total_training_tokens:
+            *tokens_part, acts_in, acts_out = next(act_iter)
+
+            if self.cfg.debug and self.cfg.is_sharded:
+                self.check_activations_across_ranks_are_equal()
+
+            loss_metrics = self._compute_training_step_loss(
+                acts_in,
+                acts_out,
+                tokens_part[0] if len(tokens_part) > 0 else None
             )
 
-            while self.n_tokens < self.cfg.total_training_tokens:
+            self.n_tokens += self.cfg.train_batch_size_tokens
 
-                *tokens_part, acts_in, acts_out = (
-                    t.to(device=self.cfg.device)
-                    for t in next(self.activations_store.__iter__())
-                )
- 
-                if self.cfg.debug and self.cfg.is_sharded:
-                    self.check_activations_across_ranks_are_equal()
+            if self.accumulation_step == 0: 
+                self._log_train_step(loss_metrics)
+                self._checkpoint_if_needed()
 
-                loss_metrics = self._compute_training_step_loss(
-                    acts_in,
-                    acts_out,
-                    tokens_part[0] if len(tokens_part) > 0 else None
-                )
+            # if self.cfg.functional_loss is not None and self.fc_scheduler.get_lr() > 0 and start_func_finetuning:
+            #     self._enable_functional_training()
+            #     start_func_finetuning = False
 
-                self.n_tokens += self.cfg.train_batch_size_tokens
+            if self.cfg.checkpoint_l0 is not None and self.monitoring_l0 is not None:
+                if self.monitoring_l0 < self.cfg.checkpoint_l0[0]:
 
-                if self.accumulation_step == 0: 
-                    self._log_train_step(loss_metrics)
-                    self._checkpoint_if_needed()
+                    self.save_checkpoint_fn(
+                        trainer=self,
+                        checkpoint_name=f"middle_{self.n_tokens}",
+                    )
+                    if self.is_main_process:
+                        self.cfg.checkpoint_l0.pop(0)
 
-                # if self.cfg.functional_loss is not None and self.fc_scheduler.get_lr() > 0 and start_func_finetuning:
-                #     self._enable_functional_training()
-                #     start_func_finetuning = False
+            if self.cfg.optimal_l0 is not None and self.monitoring_l0 is not None:
+                if self.monitoring_l0 < self.cfg.optimal_l0:
+                    logger.info(
+                        f"Stopping training at current l0 {self.monitoring_l0}"
+                    )
+                    break
 
-                if self.cfg.checkpoint_l0 is not None and self.monitoring_l0 is not None:
-                    if self.monitoring_l0 < self.cfg.checkpoint_l0[0]:
+            del acts_in, acts_out, tokens_part
+            
+            if self.accumulation_step == 0:
+                self.n_training_steps += 1
 
-                        self.save_checkpoint_fn(
-                            trainer=self,
-                            checkpoint_name=f"middle_{self.n_tokens}",
-                        )
-                        if self.is_main_process:
-                            self.cfg.checkpoint_l0.pop(0)
+        self.save_checkpoint_fn(
+            trainer=self,
+            checkpoint_name=f"final_{self.n_tokens}",
+        )
 
-                if self.cfg.optimal_l0 is not None and self.monitoring_l0 is not None:
-                    if self.monitoring_l0 < self.cfg.optimal_l0:
-                        logger.info(
-                            f"Stopping training at current l0 {self.monitoring_l0}"
-                        )
-                        break
-
-                del acts_in, acts_out, tokens_part
-                torch.cuda.empty_cache()
-                
-                if self.accumulation_step == 0:
-                    self.n_training_steps += 1
-
-            self.save_checkpoint_fn(
-                trainer=self,
-                checkpoint_name=f"final_{self.n_tokens}",
-            )
-
-            return self.clt
+        return self.clt
 
     def check_activations_across_ranks_are_equal(self, acts_in: torch.Tensor):
 
@@ -394,7 +386,8 @@ class CLTTrainer():
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
 
-                torch.nn.utils.clip_grad_norm_(self.clt.parameters(), 1.0)
+                # foreach sometimes breaks with b16 training
+                torch.nn.utils.clip_grad_norm_(self.clt.parameters(), 1.0, foreach=False)
 
                 if self.cfg.is_sharded:
                     self._synchronize_feature_sharding_gradients()
@@ -403,7 +396,9 @@ class CLTTrainer():
                 self.scaler.update()
 
             else:
-                torch.nn.utils.clip_grad_norm_(self.clt.parameters(), 1.0)
+
+                # foreach sometimes breaks with b16 training
+                torch.nn.utils.clip_grad_norm_(self._get_clt().parameters(), 1.0, foreach=False)
 
                 if self.cfg.is_sharded:
                     self._synchronize_feature_sharding_gradients()
@@ -432,12 +427,20 @@ class CLTTrainer():
             (self.n_training_steps) % self.cfg.wandb_log_frequency == 0
         ):
             logging_dict = self._build_train_step_log_dict(loss_metrics)
+
             if self.is_main_process:
-                wandb.log( # type: ignore[attr-defined]
-                    logging_dict,
-                    step=self.n_tokens * self.world_size,
+                global_tokens = (
+                    self.n_tokens
+                    if self.cfg.is_sharded
+                    else self.n_tokens * self.world_size
                 )
 
+                wandb.log( # type: ignore[attr-defined]
+                    {
+                        "tokens": global_tokens,
+                        **logging_dict,
+                    }
+                )
     def gather_feature_activations(self, feat_act: torch.Tensor) -> torch.Tensor:
         """
         Gather feature activations across feature-sharded processes.
@@ -476,13 +479,13 @@ class CLTTrainer():
             dist.all_reduce(dead_features_per_layer, op=dist.ReduceOp.SUM)
 
         # metrics for currents acts
-        dead_features_average_count = dead_features_per_layer.mean()
-        l0_across_layers = (feature_acts > 0).sum(-1).mean(0)
+        dead_features_average_count = dead_features_per_layer.float().mean()
+        l0_across_layers = (feature_acts > 0).sum(-1).float().mean(0)
         l0 = l0_across_layers.mean()
         current_learning_rate = self.optimizer.param_groups[0]["lr"]
         per_token_l2_loss = (act_out - act_pred).pow(2).sum(dim=-1) # shape
         total_variance = (act_out - act_out.mean(0)).pow(2).sum(dim=-1) # shape
-        explained_variance_across_layers = 1 - per_token_l2_loss.mean(0) / total_variance.mean(0)
+        explained_variance_across_layers = 1 - per_token_l2_loss.mean(0) / (total_variance.mean(0) + 1e-6)
         explained_variance = explained_variance_across_layers.mean()
         normalized_mse = 1 - explained_variance
         n_training_tokens = self.n_tokens * self.world_size

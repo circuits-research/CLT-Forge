@@ -3,11 +3,12 @@ from __future__ import annotations
 from typing import Iterator, Optional, Union, Any
 import os
 from pathlib import Path
+import time
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, TensorDataset
-from safetensors.torch import save_file, load_file
+from safetensors.torch import save_file, load
 import datasets
 from tqdm import tqdm
 from datasets import load_dataset, load_from_disk
@@ -22,6 +23,7 @@ from circuitlab.config import CLTTrainingRunnerConfig, AutoInterpConfig
 from circuitlab.utils import DummyModel, activation_split_path
 from circuitlab import logger
 from circuitlab.utils import DTYPE_MAP
+from concurrent.futures import ThreadPoolExecutor, Future
 
 class ActivationsStore:
     """
@@ -121,7 +123,13 @@ class ActivationsStore:
                 Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
             ]
         ] = None
-        
+
+        self._prefetch_executor: Optional[ThreadPoolExecutor] = None
+        self._prefetch_future: Optional[Future] = None
+
+        # Global schedule state: which rank is the active source for the current buffer.
+        self.active_src_rank = 0
+
         self.estimated_norm_scaling_factor_in = estimated_norm_scaling_factor_in
         self.estimated_norm_scaling_factor_out = estimated_norm_scaling_factor_out
 
@@ -129,10 +137,15 @@ class ActivationsStore:
         self.set_norm_scaling_factor_if_needed()
         self._skip_norm_application = False
 
+        # Build this rank's current local buffer.
         self._rebuild_buffers()
 
-        assert self.cfg.train_batch_size_tokens % self.cfg.context_size == 0, "ctx size must divide train_batch_size_tokens"
+        # Start background build of this rank's next local buffer.
+        if self.cfg.cached_activations_path is not None:
+            self._prefetch_executor = ThreadPoolExecutor(max_workers=1)
+            self._start_prefetch()
 
+        assert self.cfg.train_batch_size_tokens % self.cfg.context_size == 0, "ctx size must divide train_batch_size_tokens"
     # ───────────────────  token pipeline  ───────────────────
 
     def _iterate_raw_dataset_tokens(self) -> Iterator[torch.Tensor]:
@@ -270,74 +283,81 @@ class ActivationsStore:
         else:
             return torch.cat(ins, 0), torch.cat(outs, 0)
 
-    def _rebuild_buffers(self) -> None:
+    # def _rebuild_buffers(self) -> None:
 
-            return_tokens = self.return_tokens
-            use_cached = self.cfg.cached_activations_path is not None
+    #     # Because all 
 
-            if use_cached:
-                result = self._load_buffer_from_cached(return_tokens=return_tokens)
-            else:
-                result = self._fresh_activation_batches(
-                    return_tokens=return_tokens,
-                    mix_with_previous_buffer=self.mix_with_previous_buffer
-                )
+    #     return_tokens = self.return_tokens
+    #     use_cached = self.cfg.cached_activations_path is not None
+
+    #     if use_cached:
+    #         result = self._load_buffer_from_cached(return_tokens=return_tokens)
+    #     else:
+    #         result = self._fresh_activation_batches(
+    #             return_tokens=return_tokens,
+    #             mix_with_previous_buffer=self.mix_with_previous_buffer
+    #         )
+        
+    #     if return_tokens:
+    #         new_in, new_out, new_tokens = result
+    #     else:
+    #         new_in, new_out = result
+
+    #     if self.mix_with_previous_buffer and self._storage_in is not None:
+    #         all_in = torch.cat([self._storage_in, new_in], dim=0)
+    #         all_out = torch.cat([self._storage_out, new_out], dim=0)
+    #         if self.return_tokens:
+    #             all_tokens = torch.cat([self._storage_tokens, new_tokens], dim=0)
+    #     else:
+    #         all_in, all_out = new_in, new_out
+    #         if self.return_tokens:
+    #             all_tokens = new_tokens
+
+    #     # all ranks use the same seed for shuffling the current buffer.
+    #     if self.cfg.is_sharded:
+    #         self._sync_buffer_counter()
+
+    #     # print("Shuffle")
+    #     # if self.shuffle:
+    #     #     g = torch.Generator()
+    #     #     g.manual_seed(42 + self.buffer_counter)
             
-            if return_tokens:
-                new_in, new_out, new_tokens = result
-            else:
-                new_in, new_out = result
+    #     #     perm = torch.randperm(all_in.size(0), generator=g, device="cpu")
+    #     #     all_in, all_out = all_in[perm], all_out[perm]
+    #     #     if self.return_tokens:
+    #     #         all_tokens = all_tokens[perm]
+        
+    #     self.buffer_counter += 1
 
-            if self.mix_with_previous_buffer and self._storage_in is not None:
-                all_in = torch.cat([self._storage_in, new_in], dim=0)
-                all_out = torch.cat([self._storage_out, new_out], dim=0)
-                if self.return_tokens:
-                    all_tokens = torch.cat([self._storage_tokens, new_tokens], dim=0)
-            else:
-                all_in, all_out = new_in, new_out
-                if self.return_tokens:
-                    all_tokens = new_tokens
-                
-            # all ranks use the same seed for shuffling the current buffer.
-            if self.cfg.is_sharded:
-                self._sync_buffer_counter()   
+    #     if self.cfg.uses_process_group:
+    #         dist.barrier()
 
-            if self.shuffle:
-                g = torch.Generator()
-                g.manual_seed(42 + self.buffer_counter) 
-                
-                perm = torch.randperm(all_in.size(0), generator=g, device="cpu")
-                all_in, all_out = all_in[perm], all_out[perm]
-                if self.return_tokens:
-                    all_tokens = all_tokens[perm]
-            
-            self.buffer_counter += 1
+    #     if self.mix_with_previous_buffer:
+    #         split = all_in.size(0) // 2
+    #         self._storage_in, self._storage_out = all_in[:split], all_out[:split]
+    #         if self.return_tokens:
+    #             self._storage_tokens = all_tokens[:split]
+    #     else: 
+    #         split = 0
+        
+    #     if self.return_tokens:
+    #         dataset = TensorDataset(all_in[split:], all_out[split:], all_tokens[split:])
+    #     else:
+    #         dataset = TensorDataset(all_in[split:], all_out[split:])
+        
+    #     g = torch.Generator()
+    #     g.manual_seed(42 + self.buffer_counter)
 
-            if self.cfg.uses_process_group:
-                dist.barrier()
+    #     loader = DataLoader(
+    #         dataset,
+    #         batch_size=self.cfg.train_batch_size_tokens,
+    #         drop_last=True,
+    #         pin_memory=True, 
+    #         generator=g, 
+    #         shuffle=True
+    #     )
 
-            if self.mix_with_previous_buffer:
-                split = all_in.size(0) // 2
-                self._storage_in, self._storage_out = all_in[:split], all_out[:split]
-                if self.return_tokens:
-                    self._storage_tokens = all_tokens[:split]
-            else: 
-                split = 0
-            
-            in_normed = all_in[split:] if self._skip_norm_application else self.apply_norm_scaling_factor_in(all_in[split:])
-            out_normed = all_out[split:] if self._skip_norm_application else self.apply_norm_scaling_factor_out(all_out[split:])
-
-            if self.return_tokens:
-                dataset = TensorDataset(in_normed, out_normed, all_tokens[split:])
-            else:
-                dataset = TensorDataset(in_normed, out_normed)
-            loader = DataLoader(
-                dataset,
-                batch_size=self.cfg.train_batch_size_tokens,
-                shuffle=False,
-                drop_last=True
-            )
-            self._yield_iter = iter(loader)
+    #     self._yield_iter = iter(loader)
 
     def _sync_buffer_counter(self) -> None:
         counter = torch.tensor(
@@ -356,8 +376,8 @@ class ActivationsStore:
         norms_per_layer_in = []
         norms_per_layer_out = []
 
-        self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, device="cpu").float()
-        self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, device="cpu").float()
+        self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, device=self.device).float()
+        self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, device=self.device).float()
 
         for _ in tqdm(range(n_batches_for_norm_estimate), 
                       desc="Estimating norm scaling factor", 
@@ -369,10 +389,9 @@ class ActivationsStore:
             if self.rank == 0:
                 norms_per_layer_in.append(acts_in.norm(dim=-1).mean(dim=0).float())
                 norms_per_layer_out.append(acts_out.norm(dim=-1).mean(dim=0).float())
-            
-            del acts_in, acts_out
-            torch.cuda.empty_cache()
 
+        del acts_in, acts_out
+            
         if self.rank == 0:
 
             mean_norm_per_layer_in = torch.stack(norms_per_layer_in, dim=0).mean(dim=0)
@@ -405,10 +424,8 @@ class ActivationsStore:
                 dist.broadcast(tensor_in, src=0)
                 dist.broadcast(tensor_out, src=0)
 
-                self.estimated_norm_scaling_factor_in = tensor_in.cpu()
-                self.estimated_norm_scaling_factor_out = tensor_out.cpu()
-
-                del tensor_in, tensor_out # Clean up device memory
+                self.estimated_norm_scaling_factor_in = tensor_in
+                self.estimated_norm_scaling_factor_out = tensor_out
 
     def apply_norm_scaling_factor_in(self, activations: torch.Tensor) -> torch.Tensor:
         if self.estimated_norm_scaling_factor_in is None:
@@ -416,7 +433,8 @@ class ActivationsStore:
                 "estimated_norm_scaling_factor_in is not set, call set_norm_scaling_factor_if_needed() first"
             )
         scaling = self.estimated_norm_scaling_factor_in.view(1, -1, 1)
-        return activations * scaling
+        activations *= scaling # in-place operation not copying tensor
+        return activations
 
     def apply_norm_scaling_factor_out(self, activations: torch.Tensor) -> torch.Tensor:
         if self.estimated_norm_scaling_factor_out is None:
@@ -424,7 +442,8 @@ class ActivationsStore:
                 "estimated_norm_scaling_factor_out is not set, call set_norm_scaling_factor_if_needed() first"
             )
         scaling = self.estimated_norm_scaling_factor_out.view(1, -1, 1)
-        return activations * scaling
+        activations *= scaling # in-place operation not copying tensor
+        return activations
 
     def remove_norm_scaling_factor_in(self, activations: torch.Tensor) -> torch.Tensor:
         if self.estimated_norm_scaling_factor_in is None:
@@ -432,7 +451,8 @@ class ActivationsStore:
                 "estimated_norm_scaling_factor_in is not set, call set_norm_scaling_factor_if_needed() first"
             )
         scaling = self.estimated_norm_scaling_factor_in.view(1, -1, 1)
-        return activations / scaling
+        activations /= scaling # in-place operation not copying tensor
+        return activations
 
     def remove_norm_scaling_factor_out(self, activations: torch.Tensor) -> torch.Tensor:
         if self.estimated_norm_scaling_factor_out is None:
@@ -440,7 +460,8 @@ class ActivationsStore:
                 "estimated_norm_scaling_factor_out is not set, call set_norm_scaling_factor_if_needed() first"
             )
         scaling = self.estimated_norm_scaling_factor_out.view(1, -1, 1)
-        return activations / scaling
+        activations /=  scaling
+        return activations
 
     # ------------------ Generate activations, save to and load from disk ------------------
 
@@ -549,9 +570,11 @@ class ActivationsStore:
             }
             self._load_cached_activations()
 
-            self.cached_act_in = torch.cat([self.leftover_activations["act_in"], self.cached_act_in], dim=0)
-            self.cached_act_out = torch.cat([self.leftover_activations["act_out"], self.cached_act_out], dim=0)
-            self.cached_tokens = torch.cat([self.leftover_activations["tokens"], self.cached_tokens], dim=0)
+            # TODO: FIND A SOLUTION FOR THIS, CURRENTLY IGNORING THE LEFTOVER BUFFER, CAT IS TOO SLOW
+
+            # self.cached_act_in = torch.cat([self.leftover_activations["act_in"], self.cached_act_in], dim=0)
+            # self.cached_act_out = torch.cat([self.leftover_activations["act_out"], self.cached_act_out], dim=0)
+            # self.cached_tokens = torch.cat([self.leftover_activations["tokens"], self.cached_tokens], dim=0)
 
             if self.cached_act_in.shape[0] < self.n_train_batch_per_buffer * self.cfg.train_batch_size_tokens: 
                 raise ValueError(
@@ -572,10 +595,7 @@ class ActivationsStore:
 
     def _load_cached_activations(self) -> None:
         if not hasattr(self, "split"):
-            if not self.cfg.is_sharded: 
-                self.split = self.rank
-            else: 
-                self.split = 0
+            self.split = self.rank + 1201
             
         if self.cfg.cached_activations_path is None:
             raise ValueError("cached_activations_path must not be None here")
@@ -609,30 +629,218 @@ class ActivationsStore:
                 if not os.path.exists(activations_path):
                     raise FileNotFoundError(f"No cached activations found at {activations_path}")
 
-            if self.cfg.is_sharded:
-                # first process loads to RAM
-                for r in range(self.world_size):
-                    if self.rank == r:
-                        tensors = load_file(activations_path)
-                        self.cached_act_in = tensors["act_in"].to(self.dtype).cpu()
-                        self.cached_act_out = tensors["act_out"].to(self.dtype).cpu()
-                        self.cached_tokens = tensors["tokens"].cpu()
-                    dist.barrier()
-            else: 
-                tensors = load_file(activations_path)
-                self.cached_act_in = tensors["act_in"].to(self.dtype).cpu()
-                self.cached_act_out = tensors["act_out"].to(self.dtype).cpu()
-                self.cached_tokens = tensors["tokens"].cpu()
-    
-            logger.info(f"[ActivationsStore] Loaded uncompressed split {self.split} "
-                        f"with {self.cached_act_in.shape[0]} samples from {activations_path}")
+            # if self.cfg.is_sharded:
+            #     # first process loads to RAM
+            #     for r in range(self.world_size):
+            #         if self.rank == r:
+            #             tensors = load(open(activations_path, 'rb').read())
+            #             self.cached_act_in = tensors["act_in"].to(dtype=self.dtype, device="cpu")
+            #             self.cached_act_out = tensors["act_out"].to(dtype=self.dtype, device="cpu")
+            #             self.cached_tokens = tensors["tokens"].to(device="cpu")
+            #         dist.barrier()
+
+            # first process loads to RAM
+            tensors = load(open(activations_path, 'rb').read())
+            self.cached_act_in = tensors["act_in"].to(dtype=self.dtype, device="cpu")
+            self.cached_act_out = tensors["act_out"].to(dtype=self.dtype, device="cpu")
+            self.cached_tokens = tensors["tokens"].to(device="cpu")
+
+            logger.info(
+                f"[rank {self.rank}] Loaded uncompressed split {self.split} "
+                f"with {self.cached_act_in.shape[0]} samples from {activations_path}"
+            )
                 
-        if not self.cfg.is_sharded: 
-            self.split += self.world_size
-        else: 
-            self.split += 1
+        self.split += self.world_size
         self.cache_ptr = 0
 
+    def _advance_active_src_rank(self) -> None:
+        if self.cfg.uses_process_group:
+            self.active_src_rank = (self.active_src_rank + 1) % self.world_size
+        else:
+            self.active_src_rank = self.rank
+
+    def _broadcast_batch_tensor(
+        self,
+        tensor: Optional[torch.Tensor],
+        src: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        Broadcast one batch tensor from src to all ranks on GPU.
+        Non-src ranks pass tensor=None.
+        """
+        if not self.cfg.uses_process_group:
+            return tensor
+
+        dtype_to_code = {
+            torch.float32: 0,
+            torch.float16: 1,
+            torch.bfloat16: 2,
+            torch.int64: 3,
+            torch.int32: 4,
+            torch.uint8: 5,
+            torch.long: 3,
+        }
+        code_to_dtype = {v: k for k, v in dtype_to_code.items()}
+
+        if self.rank == src:
+            if tensor is None:
+                raise ValueError("Source rank must provide a tensor to broadcast.")
+            shape = list(tensor.shape)
+            ndim = len(shape)
+            dtype_code = dtype_to_code[tensor.dtype]
+        else:
+            ndim = 0
+            dtype_code = 0
+            shape = []
+
+        max_ndim = 8
+        meta = torch.full((2 + max_ndim,), -1, dtype=torch.int64, device=self.device)
+        if self.rank == src:
+            meta[0] = ndim
+            meta[1] = dtype_code
+            for i, s in enumerate(shape):
+                meta[2 + i] = s
+
+        dist.broadcast(meta, src=src)
+
+        ndim = int(meta[0].item())
+        dtype = code_to_dtype[int(meta[1].item())]
+        recv_shape = tuple(int(meta[2 + i].item()) for i in range(ndim))
+
+        if self.rank == src and tensor is not None:
+            out = tensor.to(self.device, non_blocking=True)
+        else:
+            out = torch.empty(recv_shape, dtype=dtype, device=self.device)
+
+        dist.broadcast(out, src=src)
+        return out
+
+    def _build_buffer_payload(self) -> dict[str, Any]:
+        t0 = time.time()
+        logger.info(f"[rank {self.rank}] [prefetch] build started")
+
+        return_tokens = self.return_tokens
+        use_cached = self.cfg.cached_activations_path is not None
+
+        if use_cached:
+            result = self._load_buffer_from_cached(return_tokens=return_tokens)
+        else:
+            result = self._fresh_activation_batches(
+                return_tokens=return_tokens,
+                mix_with_previous_buffer=self.mix_with_previous_buffer
+            )
+
+        if return_tokens:
+            new_in, new_out, new_tokens = result
+        else:
+            new_in, new_out = result
+
+        if self.mix_with_previous_buffer and self._storage_in is not None:
+            all_in = torch.cat([self._storage_in, new_in], dim=0)
+            all_out = torch.cat([self._storage_out, new_out], dim=0)
+            if self.return_tokens:
+                all_tokens = torch.cat([self._storage_tokens, new_tokens], dim=0)
+        else:
+            all_in, all_out = new_in, new_out
+            if self.return_tokens:
+                all_tokens = new_tokens
+
+        if self.mix_with_previous_buffer:
+            split = all_in.size(0) // 2
+            storage_in = all_in[:split]
+            storage_out = all_out[:split]
+            storage_tokens = all_tokens[:split] if self.return_tokens else None
+        else:
+            split = 0
+            storage_in = None
+            storage_out = None
+            storage_tokens = None
+
+        if self.return_tokens:
+            dataset = TensorDataset(all_in[split:], all_out[split:], all_tokens[split:])
+        else:
+            dataset = TensorDataset(all_in[split:], all_out[split:])
+
+        g = torch.Generator()
+        g.manual_seed(42 + self.buffer_counter)
+
+        loader = DataLoader(
+            dataset,
+            batch_size=self.cfg.train_batch_size_tokens,
+            drop_last=True,
+            pin_memory=True,
+            generator=g,
+            shuffle=self.shuffle,
+        )
+
+        logger.info(f"[rank {self.rank}] [prefetch] build finished in {time.time() - t0:.2f}s")
+
+        return {
+            "yield_iter": iter(loader),
+            "storage_in": storage_in,
+            "storage_out": storage_out,
+            "storage_tokens": storage_tokens,
+        }
+
+    def prefetch_status(self) -> dict[str, Any]:
+        if self._prefetch_future is None:
+            return {"status": "not_started"}
+
+        return {
+            "done": self._prefetch_future.done(),
+            "running": self._prefetch_future.running(),
+            "cancelled": self._prefetch_future.cancelled(),
+            "exception": repr(self._prefetch_future.exception()) if self._prefetch_future.done() else None,
+        }
+
+    def _install_buffer_payload(self, payload: dict[str, Any]) -> None:
+        self._yield_iter = payload["yield_iter"]
+        self._storage_in = payload["storage_in"]
+        self._storage_out = payload["storage_out"]
+        self._storage_tokens = payload["storage_tokens"]
+
+    def _rebuild_buffers(self) -> None:
+        payload = self._build_buffer_payload()
+        self._install_buffer_payload(payload)
+
+    def _start_prefetch(self) -> None:
+        if self._prefetch_executor is None:
+            return
+        if self._prefetch_future is None:
+            logger.info(f"[rank {self.rank}] [prefetch] submitting next buffer build")
+            self._prefetch_future = self._prefetch_executor.submit(self._build_buffer_payload)
+
+    def _use_prefetched_buffer(self) -> None:
+        """
+        Promote this rank's prefetched next local buffer to current,
+        then start prefetching the following one.
+        """
+        if self._prefetch_future is None:
+            self._rebuild_buffers()
+        else:
+            payload = self._prefetch_future.result()
+            self._install_buffer_payload(payload)
+            self._prefetch_future = None
+
+        self.buffer_counter += 1
+        self._start_prefetch()
+
+    def _broadcast_has_batch(self, has_batch: Optional[bool], src: int) -> bool:
+        if not self.cfg.uses_process_group:
+            if has_batch is None:
+                raise ValueError("has_batch must be provided when not distributed")
+            return has_batch
+
+        if self.rank == src:
+            if has_batch is None:
+                raise ValueError("Source rank must provide has_batch")
+            flag = torch.tensor([1 if has_batch else 0], dtype=torch.int64, device=self.device)
+        else:
+            flag = torch.empty(1, dtype=torch.int64, device=self.device)
+
+        dist.broadcast(flag, src=src)
+        return bool(flag.item())
+            
     # ───────────────────  public iterator  ───────────────────
 
     def __iter__(self):
@@ -640,16 +848,68 @@ class ActivationsStore:
             if self._yield_iter is None:
                 self._rebuild_buffers()
 
-            try:
-                batch = next(self._yield_iter)
+            src = self.active_src_rank
+
+            if self.rank == src:
+                try:
+                    batch = next(self._yield_iter)
+                    has_batch = True
+                except StopIteration:
+                    batch = None
+                    has_batch = False
+            else:
+                batch = None
+                has_batch = None
+
+            has_batch = self._broadcast_has_batch(has_batch, src)
+
+            if not has_batch:
+                if self.rank == src:
+                    if self.cfg.cached_activations_path is not None:
+                        self._use_prefetched_buffer()
+                    else:
+                        self._rebuild_buffers()
+                        self.buffer_counter += 1
+
+                self._advance_active_src_rank()
+                continue
+
+            if self.rank == src:
                 if self.return_tokens:
-                    token_batch, act_in, act_out = batch[2], batch[0], batch[1]
-                    yield token_batch, act_in, act_out
+                    token_batch_cpu, act_in_cpu, act_out_cpu = batch[2], batch[0], batch[1]
+
+                    token_batch = token_batch_cpu.to(self.device, non_blocking=False)
+                    act_in = act_in_cpu.to(self.device, non_blocking=False)
+                    act_out = act_out_cpu.to(self.device, non_blocking=False)
+
+                    token_batch = self._broadcast_batch_tensor(token_batch, src)
+                    act_in = self._broadcast_batch_tensor(act_in, src)
+                    act_out = self._broadcast_batch_tensor(act_out, src)
                 else:
-                    act_in, act_out = batch[0], batch[1]
-                    yield act_in, act_out
-            except StopIteration:
-                self._rebuild_buffers()
+                    act_in_cpu, act_out_cpu = batch[0], batch[1]
+
+                    act_in = act_in_cpu.to(self.device, non_blocking=False)
+                    act_out = act_out_cpu.to(self.device, non_blocking=False)
+
+                    act_in = self._broadcast_batch_tensor(act_in, src)
+                    act_out = self._broadcast_batch_tensor(act_out, src)
+            else:
+                if self.return_tokens:
+                    token_batch = self._broadcast_batch_tensor(None, src)
+                    act_in = self._broadcast_batch_tensor(None, src)
+                    act_out = self._broadcast_batch_tensor(None, src)
+                else:
+                    act_in = self._broadcast_batch_tensor(None, src)
+                    act_out = self._broadcast_batch_tensor(None, src)
+
+            if not self._skip_norm_application:
+                act_in = self.apply_norm_scaling_factor_in(act_in)
+                act_out = self.apply_norm_scaling_factor_out(act_out)
+
+            if self.return_tokens:
+                yield token_batch, act_in, act_out
+            else:
+                yield act_in, act_out
 
 def load_dataset_auto(
     path_or_name: str,
